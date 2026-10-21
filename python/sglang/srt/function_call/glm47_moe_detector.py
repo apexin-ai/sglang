@@ -5,7 +5,10 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -17,8 +20,28 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import safe_literal_eval
+from sglang.srt.parser.control_token_stream import ControlTokenStream
 
 logger = logging.getLogger(__name__)
+
+
+def _group(match: re.Match, text: str, group: int) -> Optional[str]:
+    """``match.group(group)`` for a match found in a marker view of ``text``."""
+    start, end = match.span(group)
+    return None if start == -1 else text[start:end]
+
+
+def _remove_markers(text: str, view: str, marker: str) -> str:
+    """``text.replace(marker, "")`` for the markers found in ``view``."""
+    parts = []
+    last = 0
+    idx = view.find(marker)
+    while idx != -1:
+        parts.append(text[last:idx])
+        last = idx + len(marker)
+        idx = view.find(marker, last)
+    parts.append(text[last:])
+    return "".join(parts)
 
 
 @lru_cache(maxsize=1)
@@ -303,6 +326,11 @@ class Glm47MoeDetector(BaseFormatDetector):
     Detector for GLM-4.7 and GLM-5 models.
     Assumes function call format:
       <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>
+
+    With the output token ids, only the six tag tokens delimit a call; the same
+    tags spelled with ordinary tokens are text. Streaming then also drops calls
+    to undeclared functions and returns an unnamed call as text at the end of
+    output, as detect_and_parse does.
     """
 
     _STREAMING_PARTIAL_PATTERN = re.compile(
@@ -310,7 +338,7 @@ class Glm47MoeDetector(BaseFormatDetector):
     )
     _TOOL_CALL_END_PATTERN = re.compile(r"</tool_call>|$")
 
-    def __init__(self):
+    def __init__(self, tokenizer: Optional[PreTrainedTokenizerBase] = None):
         super().__init__()
         self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
@@ -333,7 +361,19 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
         self._open_call: Optional[tuple[str, int]] = None
         self._end_scan_pos = 0
+        self._skipping_undeclared_tool = False
         self._reset_streaming_state()
+        self._control = ControlTokenStream.create(
+            tokenizer,
+            (
+                self.bot_token,
+                self.eot_token,
+                "<arg_key>",
+                "</arg_key>",
+                "<arg_value>",
+                "</arg_value>",
+            ),
+        )
 
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state machine for a new tool call."""
@@ -341,6 +381,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._current_key = ""
         self._current_value = ""
         self._xml_tag_buffer = ""
+        self._xml_tag_view = ""
         self._is_first_param = True
         self._value_started = False
         self._cached_value_type: Optional[str] = (
@@ -352,7 +393,18 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
-        return self.bot_token in text
+        if self._control is not None:
+            self._control.bind(text)
+        return self.bot_token in self._marker_view(text)
+
+    def _matches_ids(self) -> bool:
+        return self._control is not None and self._control.active
+
+    def _arg_pairs(self, args: str, args_view: str) -> List[Tuple[str, str]]:
+        return [
+            (_group(m, args, 1), _group(m, args, 2))
+            for m in self.func_arg_regex.finditer(args_view)
+        ]
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -362,7 +414,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        if self.bot_token not in text:
+        if self._control is not None:
+            self._control.bind(text)
+        view = self._marker_view(text)
+        if self.bot_token not in view:
             return StreamingParseResult(normal_text=text, calls=[])
 
         # Extract all normal text (before, between, and after tool calls)
@@ -370,7 +425,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         last_end = 0
 
         # Find all tool call matches
-        for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+        matches = list(re.finditer(self.func_call_regex, view, re.DOTALL))
+        for match in matches:
             # Add text before this tool call
             if match.start() > last_end:
                 normal_text_parts.append(text[last_end : match.start()])
@@ -384,19 +440,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         normal_text = "".join(normal_text_parts).strip()
 
         # Parse tool calls
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
         try:
-            for match_result in match_result_list:
+            for match in matches:
+                match_result = text[match.start() : match.end()]
+                match_view = view[match.start() : match.end()]
                 # Get function name
-                func_detail = self.func_detail_regex.search(match_result)
+                func_detail = self.func_detail_regex.search(match_view)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
-                func_args = func_detail.group(2) if func_detail.group(2) else ""
+                func_name = _group(func_detail, match_result, 1) or ""
+                func_args = _group(func_detail, match_result, 2) or ""
                 arguments = {}
                 if func_args:
-                    pairs = self.func_arg_regex.findall(func_args)
+                    args_view = _group(func_detail, match_view, 2)
+                    pairs = self._arg_pairs(func_args, args_view)
                     # Parse arguments using shared method
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
@@ -421,7 +479,11 @@ class Glm47MoeDetector(BaseFormatDetector):
         return value
 
     def _process_xml_to_json_streaming(
-        self, raw_increment: str, func_name: str, tools: List[Tool]
+        self,
+        raw_increment: str,
+        func_name: str,
+        tools: List[Tool],
+        view_increment: str,
     ) -> str:
         """Convert XML increment to JSON streaming output using state machine.
 
@@ -433,44 +495,49 @@ class Glm47MoeDetector(BaseFormatDetector):
             raw_increment: New XML content to process
             func_name: Name of the function being called
             tools: List of available tools for type inference
+            view_increment: Marker view of raw_increment
 
         Returns:
             JSON string increment to append to the output
         """
         json_output = ""
 
-        for char in raw_increment:
+        for char, view_char in zip(raw_increment, view_increment):
             self._xml_tag_buffer += char
+            self._xml_tag_view += view_char
 
             if self._stream_state in [StreamState.INIT, StreamState.BETWEEN]:
-                if self._xml_tag_buffer.endswith("<arg_key>"):
+                if self._xml_tag_view.endswith("<arg_key>"):
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
+                    self._xml_tag_view = ""
                     json_output += "{" if self._is_first_param else ", "
                     self._is_first_param = False
 
             elif self._stream_state == StreamState.IN_KEY:
-                if self._xml_tag_buffer.endswith("</arg_key>"):
+                if self._xml_tag_view.endswith("</arg_key>"):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
+                    self._xml_tag_view = ""
                     self._stream_state = StreamState.WAITING_VALUE
                     json_output += (
                         json.dumps(self._current_key, ensure_ascii=False) + ": "
                     )
 
             elif self._stream_state == StreamState.WAITING_VALUE:
-                if self._xml_tag_buffer.endswith("<arg_value>"):
+                if self._xml_tag_view.endswith("<arg_value>"):
                     self._stream_state = StreamState.IN_VALUE
                     self._current_value = ""
                     self._xml_tag_buffer = ""
+                    self._xml_tag_view = ""
                     self._value_started = False
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
 
             elif self._stream_state == StreamState.IN_VALUE:
-                if self._xml_tag_buffer.endswith("</arg_value>"):
+                if self._xml_tag_view.endswith("</arg_value>"):
                     final_value = self._xml_tag_buffer[:-12]
                     self._current_value += final_value
 
@@ -497,15 +564,16 @@ class Glm47MoeDetector(BaseFormatDetector):
                         )
 
                     self._xml_tag_buffer = ""
+                    self._xml_tag_view = ""
                     self._stream_state = StreamState.BETWEEN
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None
                 else:
                     closing_tag = "</arg_value>"
-                    is_potential_closing = len(self._xml_tag_buffer) <= len(
+                    is_potential_closing = len(self._xml_tag_view) <= len(
                         closing_tag
-                    ) and closing_tag.startswith(self._xml_tag_buffer)
+                    ) and closing_tag.startswith(self._xml_tag_view)
 
                     if not is_potential_closing:
                         content = self._xml_tag_buffer
@@ -514,6 +582,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         if value_type in ("auto", "number", "integer"):
                             self._current_value += content
                             self._xml_tag_buffer = ""
+                            self._xml_tag_view = ""
                         elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
@@ -524,6 +593,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 ]
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
+                                self._xml_tag_view = ""
                         else:
                             # object/array/boolean values stream through verbatim
                             if content:
@@ -532,25 +602,31 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
+                                self._xml_tag_view = ""
 
         return json_output
 
-    def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
+    def _extract_match_groups(self, match: re.Match, text: str) -> tuple[str, str, str]:
         """Extract function name, arguments and end marker from regex match.
 
         Args:
-            match: Regex match object
+            match: Regex match object, found in a marker view of ``text``
+            text: The text the match indexes
 
         Returns:
             (func_name, func_args_raw, is_tool_end)
         """
-        func_name = match.group(1).strip()
-        func_args_raw = match.group(2).strip() if match.group(2) else ""
-        is_tool_end = match.group(3) or ""
+        func_name = _group(match, text, 1).strip()
+        func_args_raw = (_group(match, text, 2) or "").strip()
+        is_tool_end = _group(match, text, 3) or ""
         return func_name, func_args_raw, is_tool_end
 
-    def _match_tool_call(self, text: str) -> Optional[tuple[str, str, str, int]]:
-        """Same as `_extract_match_groups` plus end() on the streaming pattern.
+    def _match_tool_call(
+        self, text: str, view: str
+    ) -> Optional[tuple[str, str, str, int, str]]:
+        """Same as `_extract_match_groups` plus end() on the streaming pattern,
+        and the marker view of the args. The pattern is searched in ``view``,
+        the marker view of ``text``; the strings are sliced from ``text``.
 
         Once an open call reaches its args, text only grows at the end, so the
         name and args start stay put and only the new tail needs scanning for
@@ -558,20 +634,36 @@ class Glm47MoeDetector(BaseFormatDetector):
         long arg.
         """
         if self._open_call is None:
-            match = self._STREAMING_PARTIAL_PATTERN.search(text)
+            match = self._STREAMING_PARTIAL_PATTERN.search(view)
             if match is None:
                 return None
             if match.group(2) is None or match.group(3):
-                return *self._extract_match_groups(match), match.end()
-            self._open_call = match.group(1).strip(), match.start(2)
+                func_name, func_args_raw, is_tool_end = self._extract_match_groups(
+                    match, text
+                )
+                func_args_view = (_group(match, view, 2) or "").strip()
+                return func_name, func_args_raw, is_tool_end, match.end(), func_args_view
+            self._open_call = _group(match, text, 1).strip(), match.start(2)
             self._end_scan_pos = match.start(2)
         func_name, args_start = self._open_call
-        end = self._TOOL_CALL_END_PATTERN.search(text, self._end_scan_pos)
+        end = self._TOOL_CALL_END_PATTERN.search(view, self._end_scan_pos)
         if end.group():
             self._open_call = None
         else:
-            self._end_scan_pos = max(args_start, len(text) - len(self.eot_token) + 1)
-        return func_name, text[args_start : end.start()].strip(), end.group(), end.end()
+            # The view masks text whose ids have not decoded yet; rescan it.
+            pending = 0
+            if self._control is not None and self._control.active:
+                pending = max(0, self._control.consumed_len - self._control._matched_len)
+            self._end_scan_pos = max(
+                args_start, len(text) - pending - len(self.eot_token) + 1
+            )
+        return (
+            func_name,
+            text[args_start : end.start()].strip(),
+            text[end.start() : end.end()],
+            end.end(),
+            view[args_start : end.start()].strip(),
+        )
 
     def _send_tool_name_if_needed(
         self, func_name: str, has_arg_key: bool, is_tool_end: str
@@ -599,6 +691,19 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
+        if (
+            self._matches_ids()
+            and func_name not in self._tool_indices
+            and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+        ):
+            # Same rule as parse_base_json on the non-streaming path: drop the
+            # call through its </tool_call> rather than stream an undeclared name.
+            logger.warning(f"Model attempted to call undefined function: {func_name}")
+            self._skipping_undeclared_tool = True
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+            return None
+
         # Send tool name
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
@@ -617,7 +722,11 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
 
     def _process_arguments_streaming(
-        self, func_name: str, func_args_raw: str, tools: List[Tool]
+        self,
+        func_name: str,
+        func_args_raw: str,
+        tools: List[Tool],
+        func_args_view: str,
     ) -> Optional[ToolCallItem]:
         """Process streaming arguments.
 
@@ -625,6 +734,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             func_name: Function name
             func_args_raw: Raw argument string
             tools: List of available tools
+            func_args_view: Marker view of func_args_raw
 
         Returns:
             Tool call item with parameter updates or None
@@ -646,7 +756,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         raw_increment = func_args_raw[self._streamed_raw_length :]
 
         json_increment = self._process_xml_to_json_streaming(
-            raw_increment, func_name, tools
+            raw_increment,
+            func_name,
+            tools,
+            func_args_view[self._streamed_raw_length :],
         )
 
         # CRITICAL: Update streamed length BEFORE early return
@@ -672,6 +785,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         tools: List[Tool],
         match_end_pos: int,
         current_text: str,
+        func_args_view: str,
     ) -> List[ToolCallItem]:
         """Complete tool call processing.
 
@@ -681,6 +795,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             tools: List of available tools
             match_end_pos: Match end position
             current_text: Current text
+            func_args_view: Marker view of func_args_raw
 
         Returns:
             List of tool call items to add
@@ -689,7 +804,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         if self._buffer_arguments:
             arguments = self._parse_argument_pairs(
-                self.func_arg_regex.findall(func_args_raw), func_name, tools
+                self._arg_pairs(func_args_raw, func_args_view), func_name, tools
             )
             serialized = json.dumps(arguments, ensure_ascii=False)
             calls.append(
@@ -729,7 +844,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         if func_args_raw:
             try:
-                pairs = self.func_arg_regex.findall(func_args_raw)
+                pairs = self._arg_pairs(func_args_raw, func_args_view)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
                     self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
@@ -758,18 +873,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         Uses a state machine to convert XML to JSON incrementally for true character-by-character streaming.
         Outputs JSON increments immediately as XML data arrives.
         """
+        if self._control is not None:
+            self._control.consume(new_text)
         self._buffer += new_text
         current_text = self._buffer
+        view = self._marker_view(current_text)
 
         # Check if we have a tool call
-        has_tool_call = self.bot_token in current_text
+        has_tool_call = self.bot_token in view
 
         if not has_tool_call:
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
-                self.bot_token.startswith(current_text[-i:])
-                for i in range(1, min(len(current_text), len(self.bot_token)) + 1)
+                self.bot_token.startswith(view[-i:])
+                for i in range(1, min(len(view), len(self.bot_token)) + 1)
             )
 
             if not is_potential_start:
@@ -779,8 +897,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                 # that turned out not to be part of a tool call
                 output_text = current_text
                 self._buffer = ""
-                if self.eot_token in output_text:
-                    output_text = output_text.replace(self.eot_token, "")
+                if self.eot_token in view:
+                    output_text = _remove_markers(output_text, view, self.eot_token)
                 return StreamingParseResult(normal_text=output_text)
             else:
                 # Could be start of tool call, keep buffering
@@ -788,10 +906,11 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Extract any text before the first bot_token and return it as normal_text
         normal_text = ""
-        first_bot_token_idx = current_text.find(self.bot_token)
+        first_bot_token_idx = view.find(self.bot_token)
         if first_bot_token_idx > 0:
             normal_text = current_text[:first_bot_token_idx]
             current_text = current_text[first_bot_token_idx:]
+            view = view[first_bot_token_idx:]
             # Update buffer to only include from the bot token onwards
             self._buffer = current_text
 
@@ -802,12 +921,19 @@ class Glm47MoeDetector(BaseFormatDetector):
         try:
             # Try to match a partial or complete tool call
             # Use a single flexible regex pattern that handles all cases
-            partial_match = self._match_tool_call(current_text)
+            partial_match = self._match_tool_call(current_text, view)
 
             if not partial_match:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            func_name, func_args_raw, is_tool_end, match_end = partial_match
+            func_name, func_args_raw, is_tool_end, match_end, func_args_view = (
+                partial_match
+            )
+
+            if self._skipping_undeclared_tool:
+                return self._skip_undeclared_tool(
+                    match_end, current_text, is_tool_end, normal_text
+                )
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
@@ -834,19 +960,23 @@ class Glm47MoeDetector(BaseFormatDetector):
 
             # Determine if function name is complete by checking for <arg_key> in the full text
             # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
+            has_arg_key = "<arg_key" in view
 
             # Send tool name if needed
             tool_name_item = self._send_tool_name_if_needed(
                 func_name, has_arg_key, is_tool_end
             )
+            if self._skipping_undeclared_tool:
+                return self._skip_undeclared_tool(
+                    match_end, current_text, is_tool_end, normal_text
+                )
             if tool_name_item:
                 calls.append(tool_name_item)
 
             # Process streaming arguments if tool name has been sent
             if self.current_tool_name_sent:
                 arg_item = self._process_arguments_streaming(
-                    func_name, func_args_raw, tools
+                    func_name, func_args_raw, tools, func_args_view
                 )
                 if arg_item:
                     calls.append(arg_item)
@@ -859,6 +989,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         tools,
                         match_end,
                         current_text,
+                        func_args_view,
                     )
                     calls.extend(finalize_calls)
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -867,6 +998,38 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
             return StreamingParseResult(normal_text=current_text)
 
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _skip_undeclared_tool(
+        self, match_end: int, text: str, is_tool_end: str, normal_text: str
+    ) -> StreamingParseResult:
+        if is_tool_end == self.eot_token:
+            self._buffer = text[match_end:]
+            self._skipping_undeclared_tool = False
+            self._reset_streaming_state()
+        return StreamingParseResult(normal_text=normal_text, calls=[])
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Parse what is still buffered, as detect_and_parse would: the calls
+        after a completed one, and the text of a call that never got a name."""
+        if not self._matches_ids():
+            return StreamingParseResult()
+        normal_text, calls = "", []
+        while self._buffer:
+            buffered = self._buffer
+            ret = self.parse_streaming_increment("", tools)
+            normal_text += ret.normal_text
+            calls.extend(ret.calls)
+            if self._buffer == buffered:
+                break
+        if not self.current_tool_name_sent and self._buffer:
+            normal_text += self._buffer
+            self._buffer = ""
+            if self.current_tool_id >= 0:
+                # Or the end-of-stream argument flush sends `{}` for a call with no name.
+                del self.prev_tool_call_arr[self.current_tool_id :]
+                del self.streamed_args_for_tool[self.current_tool_id :]
+            self._skipping_undeclared_tool = False
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _parse_argument_pairs(
