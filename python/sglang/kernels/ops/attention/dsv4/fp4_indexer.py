@@ -534,6 +534,23 @@ def fp4_index_logits_decode(
 
 
 @triton.jit
+def _e2m1_decode_int(code):
+    # Same values as _e2m1_decode without exp2: |v| = m/2 (e == 0) or (2 + m) << (e - 1) / 2.
+    e = (code >> 1) & 3
+    m = code & 1
+    nor = ((2 + m) << tl.maximum(e - 1, 0)).to(tl.float32) * 0.5
+    v = tl.where(e == 0, m.to(tl.float32) * 0.5, nor)
+    return tl.where((code >> 3) == 1, -v, v)
+
+
+@triton.jit
+def _ue8m0_scale(exps):
+    # 2^(e - 127) by writing e into the fp32 exponent; e == 0 is the subnormal 2^-127.
+    bits = tl.where(exps == 0, 0x00400000, exps.to(tl.int32) << 23)
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _fp4_index_logits_paged_kernel(
     q_ptr,
     w_ptr,
@@ -558,9 +575,20 @@ def _fp4_index_logits_paged_kernel(
     HAS_MASK: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
+    # Q and the head weights are loaded once per program; tiles with no visible candidate are skipped.
     b = tl.program_id(0)
     n_vis = tl.minimum(tl.load(lens_ptr + b), L)
     req = tl.load(req_ptr + b).to(tl.int64)
+    offs_h = tl.arange(0, H)
+    offs_i = tl.arange(0, HALF_D)
+    q_even = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
+    )
+    q_odd = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
+    )
+    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
+    sc_idx = offs_i // 16
     for tile in range(tl.program_id(1), tl.cdiv(n_vis, BLOCK_L), tl.num_programs(1)):
         offs_l = tile * BLOCK_L + tl.arange(0, BLOCK_L)
         valid = offs_l < n_vis
@@ -568,28 +596,52 @@ def _fp4_index_logits_paged_kernel(
             valid = valid & tl.load(
                 mask_ptr + b * mask_stride + offs_l, mask=offs_l < n_vis, other=False
             )
-        slot = (
-            tl.load(
-                req_table_ptr + req * req_stride + offs_l * RATIO, mask=valid, other=0
-            ).to(tl.int64)
-            // RATIO
-        )
-        logit = _fp4_index_logits_tile(
-            q_ptr,
-            w_ptr,
-            table_ptr,
-            b,
-            slot,
-            valid,
-            page_size,
-            row_stride,
-            stride_qb,
-            stride_qh,
-            stride_wb,
-            H,
-            HALF_D,
-        )
-        tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
+        if tl.sum(valid.to(tl.int32), axis=0) == 0:
+            tl.store(
+                out_ptr + b * out_stride + offs_l,
+                tl.full([BLOCK_L], float("-inf"), tl.float32),
+                mask=offs_l < L,
+            )
+        else:
+            slot = (
+                tl.load(
+                    req_table_ptr + req * req_stride + offs_l * RATIO,
+                    mask=valid,
+                    other=0,
+                ).to(tl.int64)
+                // RATIO
+            )
+            page = slot // page_size
+            off = slot % page_size
+            row_base = page * row_stride
+            pay = tl.load(
+                table_ptr
+                + row_base[:, None]
+                + off[:, None] * INDEX_K_PAYLOAD_BYTES
+                + offs_i[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            exps = tl.load(
+                table_ptr
+                + row_base[:, None]
+                + page_size * INDEX_K_PAYLOAD_BYTES
+                + off[:, None] * INDEX_K_SCALE_BYTES
+                + sc_idx[None, :],
+                mask=valid[:, None],
+                other=127,
+            )
+            scale = _ue8m0_scale(exps)
+            k_low = (_e2m1_decode_int(pay & 0x0F) * scale).to(tl.bfloat16)
+            k_high = (_e2m1_decode_int((pay >> 4) & 0x0F) * scale).to(tl.bfloat16)
+            acc = tl.dot(q_even, tl.trans(k_low))
+            acc += tl.dot(q_odd, tl.trans(k_high))
+            s = acc.to(tl.bfloat16).to(tl.float32)
+            s = tl.maximum(s, 0.0)
+            s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+            logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
+            logit = tl.where(valid, logit, float("-inf"))
+            tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
 
 
 def fp4_index_logits_paged(
@@ -648,7 +700,8 @@ def fp4_index_logits_paged(
         )
         return out
     num_sms = current_arch().num_sms
-    workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 4, batch))
+    # 16 programs per SM measured fastest on H20 (SM90) for 32-row decode batches; 4 left ~40% idle.
+    workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 16, batch))
     _fp4_index_logits_paged_kernel[(batch, workers)](
         q,
         weights,
