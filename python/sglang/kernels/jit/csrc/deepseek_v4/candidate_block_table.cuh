@@ -179,8 +179,11 @@ struct CandidateBlockTableKernel {
     host::RuntimeCheck(capacity <= 2 * 1024 * 1024, "candidate block table supports at most 2M tokens");
     if (capacity <= 1024 * 1024) {
       launch<4>(indices, seq_lens, page_table, out_pages, page_size);
-    } else {
+    } else if constexpr (device::kMaxVecBytes >= 8 * sizeof(uint32_t)) {
       launch<8>(indices, seq_lens, page_table, out_pages, page_size);
+    } else {
+      // Eight bitmap words per thread need 32-byte vectors (Blackwell or newer).
+      host::RuntimeCheck(false, "candidate block table supports at most 1M tokens before Blackwell");
     }
   }
 

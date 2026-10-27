@@ -43,11 +43,13 @@ class FullTopKIndexer:
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
         use_deep_gemm_decode: bool,
+        use_sm90_decode: bool = False,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        self.use_sm90_decode = use_sm90_decode
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
         )
@@ -61,6 +63,10 @@ class FullTopKIndexer:
     def topk_decode(self, inputs: DecodeInputs) -> None:
         if self.use_deep_gemm_decode:
             self._deep_gemm_decode(inputs)
+        elif self.use_sm90_decode:
+            from .sm90_decode import sm90_full_topk_decode
+
+            sm90_full_topk_decode(inputs, self.token_to_kv_pool)
         else:
             self._torch_decode(inputs)
 

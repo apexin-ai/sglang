@@ -2018,6 +2018,9 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # DeepSeek-V4.1 ratio-1/2 index layers on SM90 decode: score with the Triton row-gather
+    # kernels (FP4 Q, FP8 MMA, candidate consumers score only the published blocks).
+    SGLANG_OPT_HOPPER_FP4_INDEXER_ROW_GATHER = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     # SM90 paged decode indexer: split all rows' tiles evenly over the GPU instead of a
     # fixed number of CTAs per row, so one long context no longer sets the step time, and

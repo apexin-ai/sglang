@@ -64,6 +64,19 @@ def _use_deep_gemm_prefill() -> bool:
     return is_sm100_or_newer() and has_dense_fp4_indexer()
 
 
+@functools.cache
+def use_sm90_row_gather_decode() -> bool:
+    from sglang.kernels.ops.attention.deep_select import is_deep_select_supported
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_platform
+
+    return (
+        get_platform().is_sm90
+        and envs.SGLANG_OPT_HOPPER_FP4_INDEXER_ROW_GATHER.get()
+        and is_deep_select_supported()
+    )
+
+
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -74,6 +87,7 @@ def make_full_topk_indexer(
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        use_sm90_decode=use_sm90_row_gather_decode(),
     )
 
 
@@ -98,6 +112,14 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
+    if candidate_topk_blocks > 0 and use_sm90_row_gather_decode():
+        from .sm90_decode import Sm90CandidateDecode
+
+        return dense_blocks, Sm90CandidateDecode(
+            token_to_kv_pool=token_to_kv_pool,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+        )
     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 

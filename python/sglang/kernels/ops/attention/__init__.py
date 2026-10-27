@@ -432,6 +432,19 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
     )
 del _fn
 
+for _fn in ("paged_mqa_logits", "paged_sparse_mqa_logits"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.fp4_{_fn}_sm90",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.fp4_indexer_sm90:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+            ),
+        )
+    )
+del _fn
+
 # Muse Spark QK norm (+ RoPE, + KV store), built per layer: inventoried through
 # its class methods.
 for _bk in ("torch", "triton", "helion"):
