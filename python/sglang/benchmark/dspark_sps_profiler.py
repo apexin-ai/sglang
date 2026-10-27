@@ -482,7 +482,8 @@ def fetch_server_context(
         )
 
     internal_state = internal_states[0]
-    dp_size = int(internal_state.get("dp_size") or 1)
+    # --attn-dp-size leaves dp_size at 1 but reports one internal state per attention DP rank.
+    dp_size = max(int(internal_state.get("dp_size") or 1), len(internal_states))
     cuda_graph_max_bs = resolve_cuda_graph_max_bs(internal_state=internal_state)
     max_running_per_dp = internal_state.get("effective_max_running_requests_per_dp", -1)
     if max_running_per_dp and max_running_per_dp > 0:
