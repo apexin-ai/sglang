@@ -1556,6 +1556,24 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    if (
+        get_platform().is_sm90
+        and act_scale_ue8m0
+        and _use_gluon_block32_gemm(
+            m=input_2d.shape[0],
+            weight=weight,
+            weight_scale=weight_scale,
+            block_size=block_size,
+            output_dtype=output_dtype,
+        )
+    ):
+        output = _gluon_block32_linear(
+            input_2d=input_2d, weight=weight, weight_scale=weight_scale
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
+
     if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
         # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
@@ -1582,6 +1600,51 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+@lru_cache(maxsize=1)
+def _gluon_block32_max_m() -> int:
+    return envs.SGLANG_OPT_HOPPER_BLOCK32_GLUON_MAX_M.get()
+
+
+def _use_gluon_block32_gemm(
+    m: int,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype,
+) -> bool:
+    n, k = weight.shape
+    return (
+        m <= _gluon_block32_max_m()
+        and list(block_size) == [32, 32]
+        and output_dtype == torch.bfloat16
+        and k % 128 == 0
+        and weight.is_contiguous()
+        and weight_scale.dtype == torch.float32
+        and weight_scale.is_contiguous()
+        and tuple(weight_scale.shape) == (ceil_div(n, 32), k // 32)
+    )
+
+
+def _gluon_block32_linear(
+    input_2d: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    # Imported lazily: Gluon's Hopper module needs a recent Triton and is SM90-only.
+    from sglang.kernels.ops.gemm.fp8_block32_gemm_sm90 import fp8_block32_gemm
+
+    # Power-of-two scales as on the DeepGEMM path, packed UE8M0 in the MN-major TMA layout.
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        32,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    output = input_2d.new_empty(
+        (input_2d.shape[0], weight.shape[0]), dtype=torch.bfloat16
+    )
+    return fp8_block32_gemm(q_input, x_scale, weight, weight_scale, output)
 
 
 def _unpack_ue8m0_scale_for_triton(

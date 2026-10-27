@@ -1255,6 +1255,9 @@ class Envs:
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
+    # Largest M routed to the Gluon block32 FP8 GEMM on SM90 (DeepGEMM above it); 0 disables.
+    # Measured on H20 DSv4.1 shapes: 1.1-2.1x faster up to M=64, break-even at M=128.
+    SGLANG_OPT_HOPPER_BLOCK32_GLUON_MAX_M = EnvInt(64)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)

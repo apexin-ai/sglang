@@ -432,6 +432,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.fp8_block32_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_block32_gemm_sm90:fp8_block32_gemm",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
