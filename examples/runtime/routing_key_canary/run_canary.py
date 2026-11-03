@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
-
 from gateway import GENERATION_PATHS
 
 HERE = Path(__file__).resolve().parent
@@ -492,7 +491,7 @@ async def cache_tests(runtime, session, router, guard, probes, engines):
                 turn["worker"] = record["worker_id"]
                 if mode == "stable_key":
                     expected = hashlib.sha256(
-                        (runtime.attempt + f':trajectory:{row["trajectory"]}').encode()
+                        (runtime.attempt + f":trajectory:{row['trajectory']}").encode()
                     ).hexdigest()
                     require(
                         record["key_sha256"] == expected,

@@ -4,7 +4,6 @@ import unittest
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-
 from gateway import GENERATION_PATHS, create_app, validate_routing_key
 
 
