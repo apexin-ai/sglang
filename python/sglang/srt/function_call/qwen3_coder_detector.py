@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 
 from jsonschema import Draft202012Validator
 from referencing import Registry
+from transformers import PreTrainedTokenizerBase
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -19,12 +20,30 @@ from sglang.srt.function_call.utils import (
     infer_type_from_json_schema,
     safe_literal_eval,
 )
+from sglang.srt.parser.control_token_stream import ControlTokenStream
 
 logger = logging.getLogger(__name__)
 
 
 class Qwen3CoderDetector(BaseFormatDetector):
-    def __init__(self):
+    """
+    Detector for the Qwen3-Coder XML tool-call format:
+      <tool_call>
+      <function=name>
+      <parameter=key>
+      value
+      </parameter>
+      </function>
+      </tool_call>
+
+    With the output token ids, only the `<tool_call>` and `</tool_call>` tokens
+    open and close a call; the same strings spelled with ordinary tokens are
+    text, also inside a parameter value. `<function=`, `<parameter=`,
+    `</parameter>` and `</function>` are not single tokens, so they are still
+    matched as text, but only inside a call.
+    """
+
+    def __init__(self, tokenizer: Optional[PreTrainedTokenizerBase] = None):
         super().__init__()
 
         # Sentinel tokens
@@ -62,8 +81,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
+        self._control = ControlTokenStream.create(
+            tokenizer, (self.tool_call_start_token, self.tool_call_end_token)
+        )
+
+    def _matches_ids(self) -> bool:
+        return self._control is not None and self._control.active
+
     def has_tool_call(self, text: str) -> bool:
-        return self.tool_call_start_token in text
+        if self._control is not None:
+            self._control.bind(text)
+        return self.tool_call_start_token in self._marker_view(text)
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -216,17 +244,31 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
-        if self.tool_call_start_token not in text:
+        if self._control is not None:
+            self._control.bind(text)
+        view = self._marker_view(text)
+        if self.tool_call_start_token not in view:
             return StreamingParseResult(normal_text=text)
 
         calls = []
         try:
             # Simple cleanup of the text to find tool calls
             # Note: This is a simplified regex approach consistent with vLLM
-            raw_tool_calls = self.tool_call_regex.findall(text)
+            # The regex runs on the marker view, so a `</tool_call>` spelled
+            # with ordinary tokens inside a value does not end the call.
+            raw_tool_calls = [
+                text[m.start(1) : m.end(1)]
+                for m in self.tool_call_regex.finditer(view)
+            ]
             if not raw_tool_calls:
                 # Fallback: maybe the whole text is inside the tag or tags are stripped
-                if self.tool_call_prefix in text:
+                if self._matches_ids():
+                    # Only from the `<tool_call>` token on: a spelled
+                    # `<function=` in the text before it is not a call.
+                    tail = text[view.find(self.tool_call_start_token) :]
+                    if self.tool_call_prefix in tail:
+                        raw_tool_calls = [tail]
+                elif self.tool_call_prefix in text:
                     raw_tool_calls = [text]
 
             tool_idx = 0
@@ -273,7 +315,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     tool_idx += 1
 
             # Determine normal text (text before the first tool call)
-            start_idx = text.find(self.tool_call_start_token)
+            start_idx = view.find(self.tool_call_start_token)
             if start_idx == -1:
                 start_idx = text.find(self.tool_call_prefix)
             normal_text = text[:start_idx] if start_idx > 0 else ""
@@ -290,6 +332,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         """
         Robust cursor-based streaming parser.
         """
+        if self._control is not None:
+            self._control.consume(new_text)
         self._buffer += new_text
 
         # Guard against empty buffer
@@ -299,9 +343,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
         calls = []
         normal_text_chunks = []
 
+        # `<tool_call>` / `</tool_call>` are searched in the marker view; with
+        # the output ids, the text tags only count inside a call.
+        view = self._marker_view(self._buffer)
+        by_ids = self._matches_ids()
+
         while True:
             # Working text slice
             current_slice = self._buffer[self.parsed_pos :]
+            view_slice = view[self.parsed_pos :]
+            text_tags_active = not by_ids or self.is_inside_tool_call
 
             # Optimization: If almost empty, wait for more
             if not current_slice:
@@ -310,7 +361,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_start_token):
+            if view_slice.startswith(self.tool_call_start_token):
                 self.parsed_pos += len(self.tool_call_start_token)
                 self.is_inside_tool_call = True
                 continue
@@ -318,7 +369,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 2. Function Name: <function=name>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_prefix):
+            if text_tags_active and current_slice.startswith(self.tool_call_prefix):
                 end_angle = current_slice.find(">")
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
@@ -346,7 +397,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 3. Parameter: <parameter=name>value...
             # -------------------------------------------------------
-            if current_slice.startswith(self.parameter_prefix):
+            if text_tags_active and current_slice.startswith(self.parameter_prefix):
                 name_end = current_slice.find(">")
                 if name_end != -1:
                     value_start_idx = name_end + 1
@@ -434,7 +485,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 4. Function End: </function>
             # -------------------------------------------------------
-            if current_slice.startswith(self.function_end_token):
+            if text_tags_active and current_slice.startswith(self.function_end_token):
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -451,7 +502,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 5. Tool Call End: </tool_call>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_end_token):
+            if view_slice.startswith(self.tool_call_end_token):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
                 continue
@@ -476,20 +527,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
             elif next_open_angle == 0:
                 # Looks like a Tag, but doesn't match any known Tag above
 
-                possible_tags = [
-                    self.tool_call_start_token,
-                    self.tool_call_end_token,
+                text_tags = [
                     self.tool_call_prefix,
                     self.function_end_token,
                     self.parameter_prefix,
                     self.parameter_end_token,
                 ]
-
-                is_potential_tag = False
-                for tag in possible_tags:
-                    if tag.startswith(current_slice):
-                        is_potential_tag = True
-                        break
+                is_potential_tag = any(
+                    tag.startswith(view_slice)
+                    for tag in (self.tool_call_start_token, self.tool_call_end_token)
+                ) or (
+                    text_tags_active
+                    and any(tag.startswith(current_slice) for tag in text_tags)
+                )
 
                 if is_potential_tag:
                     break  # Wait for more

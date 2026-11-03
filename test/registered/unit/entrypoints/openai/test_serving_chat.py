@@ -5273,6 +5273,136 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 self.assertEqual(json.loads(streamed_arguments), arguments)
 
+    def test_qwen3_parsers_get_the_output_ids(self):
+        """Chat responses pass the output ids to the qwen3 reasoning parser and
+        the ids of the content to the qwen3_coder tool-call parser, so tags
+        Qwen3 spells with ordinary tokens stay text in reasoning and in
+        arguments."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        def byte_level_tokenizer(*added_tokens):
+            alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+            backend = Tokenizer(models.BPE({c: i for i, c in enumerate(alphabet)}, []))
+            backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            backend.decoder = decoders.ByteLevel()
+            backend.add_tokens(list(added_tokens))
+            return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+        markers = ["<think>", "</think>", "<tool_call>", "</tool_call>"]
+        tokenizer = byte_level_tokenizer(*markers)
+        plain = byte_level_tokenizer()
+        ids = []
+        for part in [
+            "Emit <tool_call> and </think> later.",
+            "</think>",
+            "Calling.",
+            "<tool_call>",
+            "\n<function=write>\n<parameter=content>\na</tool_call>b\n",
+            "</parameter>\n</function>\n",
+            "</tool_call>",
+        ]:
+            ids += (
+                [tokenizer.convert_tokens_to_ids(part)]
+                if part in markers
+                else plain.encode(part)
+            )
+        self.tm.tokenizer = tokenizer
+        self.chat.reasoning_parser = "qwen3"
+        self.chat.tool_call_parser = "qwen3_coder"
+        self.template_manager.force_reasoning = True
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        reasoning = "Emit <tool_call> and </think> later."
+        content = "Calling."
+        arguments = {"content": "a</tool_call>b"}
+
+        ret = self._output_ids_ret(ids)
+        ret[0]["text"] = tokenizer.decode(ids)
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}], tools=tools
+        )
+        message = self.chat._build_chat_response(request, ret, 123).choices[0].message
+        self.assertEqual(
+            (message.reasoning_content, message.content), (reasoning, content)
+        )
+        self.assertEqual(
+            [json.loads(c.function.arguments) for c in message.tool_calls], [arguments]
+        )
+
+        for incremental in (True, False):
+            with self.subTest(incremental=incremental):
+                enter_override(
+                    self,
+                    get_context().override_server_args(
+                        incremental_streaming_output=incremental
+                    ),
+                )
+
+                async def generate():
+                    for i in range(len(ids)):
+                        text = tokenizer.decode(ids[: i + 1])
+                        yield {
+                            "text": (
+                                text[len(tokenizer.decode(ids[:i])) :]
+                                if incremental
+                                else text
+                            ),
+                            "output_ids": (
+                                ids[i : i + 1] if incremental else ids[: i + 1]
+                            ),
+                            "meta_info": {
+                                "id": "chatcmpl-qwen3-ids",
+                                "prompt_tokens": 3,
+                                "completion_tokens": i + 1,
+                                "cached_tokens": 0,
+                                "finish_reason": (
+                                    {"type": "stop", "matched": None}
+                                    if i == len(ids) - 1
+                                    else None
+                                ),
+                            },
+                            "index": 0,
+                        }
+
+                self.tm.generate_request.return_value = generate()
+                stream_request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tools=tools,
+                    stream=True,
+                )
+                deltas = [
+                    chunk["choices"][0]["delta"]
+                    for chunk in self._parse_chunks(
+                        self._run_chat_stream(Mock(), stream_request)
+                    )
+                    if chunk["choices"]
+                ]
+                self.assertEqual(
+                    "".join(d.get("reasoning_content") or "" for d in deltas),
+                    reasoning,
+                )
+                self.assertEqual(
+                    "".join(d.get("content") or "" for d in deltas), content
+                )
+                streamed_arguments = "".join(
+                    call["function"].get("arguments") or ""
+                    for d in deltas
+                    for call in d.get("tool_calls") or []
+                )
+                self.assertEqual(json.loads(streamed_arguments), arguments)
+
     def test_streaming_output_ids_incremental_accumulates_deltas(self):
         sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)
 

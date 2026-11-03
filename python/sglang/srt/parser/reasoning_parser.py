@@ -528,6 +528,13 @@ class Qwen3Detector(BaseReasoningFormatDetector):
       - enable_thinking=True: "<think>reasoning content</think>The answer is 42."
       - enable_thinking=False: "The answer is 42." (no thinking tokens)
 
+    With the output token ids, only the `<think>`, `</think>` and `<tool_call>`
+    tokens act as markers; the same strings spelled with ordinary tokens are
+    text. Streaming then holds a `<tool_call>` token seen inside reasoning
+    until a later `</think>` keeps it as reasoning or the end of output makes
+    it the start of a call, as one-shot parsing decides. Subclasses that do not
+    take ``tokenizer`` keep matching by text.
+
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
             If True, streams reasoning content as it arrives.
@@ -540,6 +547,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -562,6 +570,12 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+        self._control = ControlTokenStream.create(
+            tokenizer, (self.think_start_token, self.think_end_token, "<tool_call>")
+        )
+
+    def _defers_tool_start(self) -> bool:
+        return self._control is not None and self._control.active
 
 
 class KimiDetector(BaseReasoningFormatDetector):
