@@ -25,7 +25,7 @@ gh api -X POST repos/apexin-ai/sglang/merge-upstream -f branch=main
 
 ## 功能：Qwen3.8 prompt 侧特殊 token 消毒（`--sanitize-control-tokens`）
 
-分支 `apex/pr/qwen38-prompt-sanitize`。设计稿在 apex-workspace 仓库 `qwen38-flash-next-training/reports/2026-11-01-prompt-sanitization/README.md`。
+分支 `apex/pr/qwen38-prompt-sanitize`。设计稿在 apex-workspace 仓库 `sglang/reports/2026-11-01-prompt-sanitization/README.md`。
 
 ### 作用
 
