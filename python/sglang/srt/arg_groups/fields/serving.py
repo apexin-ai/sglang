@@ -216,6 +216,19 @@ class Serving(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    sanitize_control_tokens: A[
+        str,
+        Arg(
+            help="Apex fork: encode added-token strings (e.g. <|im_end|>, <think>) "
+            "inside chat message fields as ordinary text instead of control ids. "
+            "Qwen3.8 tokenizer and chat template only; other models are unchanged. "
+            "'on': default on, a request can turn it off with "
+            "chat_template_kwargs.sanitize_control_tokens=false. Text-only "
+            "requests on the jinja chat path; not a security boundary (input_ids, "
+            "/generate and /v1/completions bypass it).",
+            choices=["off", "on"],
+        ),
+    ] = "off"
     strip_thinking_cache: A[
         bool,
         "Skip caching reasoning-model output (thinking + answer) in the radix tree on finish; keep only the prompt prefix. Opt-in: changes cache contents.",

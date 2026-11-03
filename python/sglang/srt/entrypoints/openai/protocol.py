@@ -2468,6 +2468,8 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    # Apex: prompt_ids hold Qwen3.8-sanitized ids; send them, not the text.
+    sanitized_prompt_ids: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):

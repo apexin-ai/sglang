@@ -1151,6 +1151,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--sanitize-control-tokens`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apex fork: encode added-token strings (e.g. <code>&lt;|im_end|&gt;</code>, <code>&lt;think&gt;</code>) inside chat message fields as ordinary text instead of control ids. Qwen3.8 tokenizer and chat template only; other models are unchanged. <code>on</code>: default on, a request can turn it off with <code>chat_template_kwargs.sanitize_control_tokens=false</code>. Text-only requests on the jinja chat path; not a security boundary (<code>input_ids</code>, <code>/generate</code> and <code>/v1/completions</code> bypass it). See <code>docs/apex/README.md</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`off`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>off</code>, <code>on</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--completion-template`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

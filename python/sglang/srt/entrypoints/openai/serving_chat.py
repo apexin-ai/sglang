@@ -56,6 +56,9 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
     parallel_prompt_encode,
 )
+from sglang.srt.entrypoints.openai.qwen38_prompt_sanitize import (
+    Qwen38PromptSanitizer,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -484,6 +487,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
+        # Apex: Qwen3.8 prompt-side special-token sanitization.
+        self._prompt_sanitizer = self._build_prompt_sanitizer()
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
         )
@@ -519,6 +524,33 @@ class OpenAIServingChat(OpenAIServingBase):
             # A template that needs kwargs this probe does not supply tells us
             # nothing; keep the long-standing text path.
             return False
+
+    def _build_prompt_sanitizer(self) -> Optional[Qwen38PromptSanitizer]:
+        """The --sanitize-control-tokens=on sanitizer, or None (server unchanged)."""
+        serving = get_serving()
+        if getattr(serving, "sanitize_control_tokens", "off") != "on":
+            return None
+        if (
+            self.template_manager.chat_template_name is not None
+            or self.template_manager.python_chat_template is not None
+            or self.chat_encoding_spec is not None
+            or self._prompt_text_round_trip_is_lossy
+        ):
+            logger.warning(
+                "sanitize-control-tokens=on needs the default jinja chat path; "
+                "sanitization disabled"
+            )
+            return None
+        tokenizer = self.tokenizer_manager.tokenizer
+        return Qwen38PromptSanitizer.build(
+            tokenizer,
+            [
+                getattr(serving, "tokenizer_path", None),
+                getattr(tokenizer, "name_or_path", None),
+            ],
+            enable_prometheus=getattr(self.tokenizer_manager, "enable_metrics", False)
+            is True,
+        )
 
     def _chat_template_reads_reasoning_content(self) -> bool:
         template = self.default_chat_template_kwargs.get("chat_template")
@@ -565,7 +597,7 @@ class OpenAIServingChat(OpenAIServingBase):
         return messages, assistant_prefix
 
     def _append_assistant_prefix_to_prompt_ids(
-        self, prompt_ids: list[int], assistant_prefix: str
+        self, prompt_ids: list[int], assistant_prefix: str, sanitize: bool = False
     ) -> list[int]:
         """
         Append assistant prefix to prompt_ids.
@@ -573,11 +605,14 @@ class OpenAIServingChat(OpenAIServingBase):
         Args:
             prompt_ids: Current prompt token IDs
             assistant_prefix: Assistant message content to append
+            sanitize: Encode the prefix as ordinary text (Qwen3.8 sanitization)
 
         Returns:
             Updated prompt_ids with assistant prefix appended
         """
         detector = self._reasoning_detector
+        if sanitize and not isinstance(detector, ResponseTemplateReasoningDetector):
+            return prompt_ids + self._prompt_sanitizer.encode_prefix(assistant_prefix)
         if isinstance(detector, ResponseTemplateReasoningDetector):
             prompt = self.tokenizer_manager.tokenizer.decode(
                 prompt_ids,
@@ -1252,7 +1287,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # ids instead. Only when nothing needs placeholder expansion: with media
         # attached the MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
+            (
+                self._prompt_text_round_trip_is_lossy
+                # Re-tokenizing the text would undo the sanitized ids.
+                or getattr(processed_messages, "sanitized_prompt_ids", False)
+            )
             and isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
             and not (
@@ -2041,6 +2080,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
+        sanitized_prompt_ids = False
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -2201,6 +2241,27 @@ class OpenAIServingChat(OpenAIServingBase):
                         request.reasoning_effort,
                     )
 
+            # Apex: Qwen3.8 prompt sanitization. The request flag never reaches the
+            # template or the cache key. No added-token string in what the template
+            # renders -> the unchanged code below (fast path).
+            sanitize = sanitize_prefix = False
+            sanitizer = getattr(self, "_prompt_sanitizer", None)
+            if sanitizer is not None and sanitizer.pop_request_flag(
+                extra_template_kwargs
+            ):
+                body_hit = sanitizer.scan(openai_compatible_messages, tools)
+                prefix_hit = bool(assistant_prefix) and sanitizer.text_hit(
+                    assistant_prefix, edges=False
+                )
+                if body_hit or prefix_hit:
+                    sanitizer.count("hit")
+                    if image_data or video_data or audio_data:
+                        # Text-only in v1: the MM processor re-tokenizes the text.
+                        sanitizer.fallback("media")
+                    else:
+                        sanitize, sanitize_prefix = body_hit, prefix_hit
+            sanitized_prompt_ids = sanitize or sanitize_prefix
+
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
@@ -2225,6 +2286,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
                     add_generation_prompt=add_generation_prompt is not False,
+                    sanitize=sanitize,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -2242,6 +2304,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
                         add_generation_prompt=add_generation_prompt is not False,
+                        sanitize=sanitize,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -2252,7 +2315,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
+                    prompt_ids, assistant_prefix, sanitize=sanitize_prefix
                 )
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
@@ -2277,6 +2340,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            sanitized_prompt_ids=sanitized_prompt_ids,
         )
 
     def _render_and_encode_chat_template(
@@ -2288,6 +2352,7 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
         add_generation_prompt: bool = True,
+        sanitize: bool = False,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
@@ -2305,6 +2370,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs,
                         encode_kwargs,
                         add_generation_prompt,
+                        sanitize,
                     ),
                 )
             except TypeError:
@@ -2354,6 +2420,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = parallel_prompt_encode(
                     self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
                 )
+                if sanitize:
+                    prompt_ids = self._prompt_sanitizer.encode(
+                        rendered_prompt,
+                        prompt_ids,
+                        chat_template=template_kwargs.get(
+                            "chat_template",
+                            getattr(
+                                self.tokenizer_manager.tokenizer, "chat_template", None
+                            ),
+                        ),
+                        messages=messages,
+                        tools=tools,
+                        template_kwargs=template_kwargs,
+                        add_generation_prompt=add_generation_prompt,
+                        encode_kwargs=encode_kwargs,
+                    )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
@@ -3408,10 +3490,19 @@ class OpenAIServingChat(OpenAIServingBase):
         rather than via :meth:`wrap_reasoning_history`; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
-        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
-            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
-            and self.template_manager.chat_template_name is None
-            and self._template_reads_reasoning_content
+        return (
+            chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
+            or (
+                isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+                and self.template_manager.chat_template_name is None
+                and self._template_reads_reasoning_content
+            )
+            # Apex: with Qwen3.8 sanitization on, history wrapped as "<think>..."
+            # text would be encoded as plain text; pass reasoning_content instead.
+            or (
+                getattr(self, "_prompt_sanitizer", None) is not None
+                and self._template_reads_reasoning_content
+            )
         )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
