@@ -1,0 +1,54 @@
+# RBAC for the gateway's tenancy module.
+#
+# The key ConfigMap is readable only: a gateway that could write it could mint
+# itself an admin key. Allocations live in a second ConfigMap that the gateway
+# reads and writes, and that holds no credentials.
+#
+# resourceNames pins the get/update rules to the two objects named in
+# --tenancy-keys-configmap and --tenancy-alloc-configmap; adjust the names here if
+# those flags change. Kubernetes cannot restrict list, watch or create by
+# resourceNames, so those rules are namespace-wide; the watch is narrowed
+# client-side by a metadata.name field selector.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smg-tenancy
+  namespace: infer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smg-tenancy
+  namespace: infer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["smg-tenant-keys"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["smg-tenant-alloc"]
+    verbs: ["get", "update"]
+  # Only needed when the alloc ConfigMap is not pre-created; drop this rule
+  # after applying tenancy-configmaps.example.yaml, since create cannot be
+  # restricted to one object name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smg-tenancy
+  namespace: infer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: smg-tenancy
+subjects:
+  - kind: ServiceAccount
+    name: smg-tenancy
+    namespace: infer
