@@ -596,6 +596,12 @@ pub fn build_app(
             middleware::wasm_middleware,
         ));
 
+    #[cfg(feature = "tenancy")]
+    let protected_routes = crate::tenancy::wiring::apply_layers(
+        protected_routes,
+        app_state.context.tenancy.as_deref(),
+    );
+
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
         .route("/readiness", get(readiness))
@@ -679,7 +685,10 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
-    Router::new()
+    #[cfg(feature = "tenancy")]
+    let tenancy_routes = crate::tenancy::wiring::api_routes(app_state.context.tenancy.as_deref());
+
+    let app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
@@ -696,7 +705,13 @@ pub fn build_app(
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
-        .with_state(app_state)
+        .with_state(app_state);
+
+    // Merged after `with_state`: these routes carry their own state, so they
+    // only share a state type with the rest once the parent's is applied.
+    #[cfg(feature = "tenancy")]
+    let app = app.merge(tenancy_routes);
+    app
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -810,6 +825,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
+    }
+
+    #[cfg(feature = "tenancy")]
+    if let Some(tenancy) = app_context.tenancy.as_deref() {
+        crate::tenancy::wiring::start_pool_sampler(
+            tenancy,
+            Arc::clone(&app_context.worker_registry),
+        );
     }
 
     let weak_context = Arc::downgrade(&app_context);

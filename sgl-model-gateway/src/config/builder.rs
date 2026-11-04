@@ -484,6 +484,36 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn maybe_tenancy_keys_configmap(mut self, name: Option<&String>) -> Self {
+        self.config.tenancy_keys_configmap = name.cloned();
+        self
+    }
+
+    pub fn tenancy_alloc_configmap(mut self, name: String) -> Self {
+        self.config.tenancy_alloc_configmap = name;
+        self
+    }
+
+    pub fn maybe_tenancy_namespace(mut self, namespace: Option<&String>) -> Self {
+        self.config.tenancy_namespace = namespace.cloned();
+        self
+    }
+
+    pub fn tenancy_pool_headroom(mut self, headroom: f32) -> Self {
+        self.config.tenancy_pool_headroom = headroom;
+        self
+    }
+
+    pub fn maybe_tenancy_pool_size(mut self, size: Option<u32>) -> Self {
+        self.config.tenancy_pool_size = size;
+        self
+    }
+
+    pub fn tenancy_resync_secs(mut self, secs: u64) -> Self {
+        self.config.tenancy_resync_secs = secs;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

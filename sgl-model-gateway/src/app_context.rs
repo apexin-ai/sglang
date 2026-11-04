@@ -59,6 +59,8 @@ pub struct AppContext {
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    #[cfg(feature = "tenancy")]
+    pub tenancy: Option<Arc<crate::tenancy::wiring::TenancyRuntime>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -70,6 +72,8 @@ impl std::fmt::Debug for AppContext {
 }
 
 pub struct AppContextBuilder {
+    #[cfg(feature = "tenancy")]
+    tenancy: Option<Arc<crate::tenancy::wiring::TenancyRuntime>>,
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
@@ -100,16 +104,22 @@ impl AppContext {
         router_config: RouterConfig,
         request_timeout_secs: u64,
     ) -> Result<Self, String> {
-        AppContextBuilder::from_config(router_config, request_timeout_secs)
-            .await?
-            .build()
-            .map_err(|e| e.to_string())
+        #[cfg(feature = "tenancy")]
+        let tenancy = crate::tenancy::wiring::build(&router_config)
+            .await
+            .map(Arc::new);
+        let builder = AppContextBuilder::from_config(router_config, request_timeout_secs).await?;
+        #[cfg(feature = "tenancy")]
+        let builder = builder.tenancy(tenancy);
+        builder.build().map_err(|e| e.to_string())
     }
 }
 
 impl AppContextBuilder {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "tenancy")]
+            tenancy: None,
             client: None,
             router_config: None,
             rate_limiter: None,
@@ -128,6 +138,12 @@ impl AppContextBuilder {
             mcp_manager: None,
             wasm_manager: None,
         }
+    }
+
+    #[cfg(feature = "tenancy")]
+    pub fn tenancy(mut self, runtime: Option<Arc<crate::tenancy::wiring::TenancyRuntime>>) -> Self {
+        self.tenancy = runtime;
+        self
     }
 
     pub fn client(mut self, client: Client) -> Self {
@@ -281,6 +297,8 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
+            #[cfg(feature = "tenancy")]
+            tenancy: self.tenancy,
         })
     }
 

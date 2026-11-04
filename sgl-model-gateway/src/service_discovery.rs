@@ -883,6 +883,8 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            #[cfg(feature = "tenancy")]
+            tenancy: None,
         })
     }
 

@@ -84,12 +84,7 @@ impl TenantManager {
 
     pub fn pool_snapshot(&self) -> PoolSnapshot {
         let total = self.pool_total.load(Ordering::Relaxed);
-        let allocated: u32 = self
-            .table()
-            .tenants
-            .keys()
-            .map(|t| self.allocated(t))
-            .sum();
+        let allocated: u32 = self.table().tenants.keys().map(|t| self.allocated(t)).sum();
         PoolSnapshot {
             total,
             allocated,

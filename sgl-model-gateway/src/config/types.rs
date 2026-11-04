@@ -63,6 +63,23 @@ pub struct RouterConfig {
     /// the session-affinity policies fall back to a random worker.
     #[serde(default)]
     pub require_routing_key: bool,
+    /// ConfigMap holding the tenant key table; `None` leaves tenancy off.
+    #[serde(default)]
+    pub tenancy_keys_configmap: Option<String>,
+    /// ConfigMap the gateway writes allocations back to.
+    #[serde(default = "default_tenancy_alloc_configmap")]
+    pub tenancy_alloc_configmap: String,
+    /// Namespace of both ConfigMaps; defaults to "default".
+    #[serde(default)]
+    pub tenancy_namespace: Option<String>,
+    /// Share of the workers' combined capacity offered to tenants.
+    #[serde(default = "default_tenancy_pool_headroom")]
+    pub tenancy_pool_headroom: f32,
+    /// Fixed pool size; when set, worker capacity is not consulted.
+    #[serde(default)]
+    pub tenancy_pool_size: Option<u32>,
+    #[serde(default = "default_tenancy_resync_secs")]
+    pub tenancy_resync_secs: u64,
     #[serde(default)]
     pub enable_igw: bool,
     /// Can be a HuggingFace model ID or local path
@@ -175,6 +192,19 @@ impl Default for TokenizerCacheConfig {
             l1_max_memory: default_l1_max_memory(),
         }
     }
+}
+
+fn default_tenancy_alloc_configmap() -> String {
+    "smg-tenant-alloc".to_string()
+}
+
+/// Arbitrary; leaves room for retries and non-tenant traffic.
+fn default_tenancy_pool_headroom() -> f32 {
+    0.8
+}
+
+fn default_tenancy_resync_secs() -> u64 {
+    30
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -543,6 +573,12 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             require_routing_key: false,
+            tenancy_keys_configmap: None,
+            tenancy_alloc_configmap: default_tenancy_alloc_configmap(),
+            tenancy_namespace: None,
+            tenancy_pool_headroom: default_tenancy_pool_headroom(),
+            tenancy_pool_size: None,
+            tenancy_resync_secs: default_tenancy_resync_secs(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             model_path: None,

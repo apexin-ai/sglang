@@ -398,6 +398,12 @@ struct Router {
     retry_jitter_factor: f32,
     disable_retries: bool,
     require_routing_key: bool,
+    tenancy_keys_configmap: Option<String>,
+    tenancy_alloc_configmap: String,
+    tenancy_namespace: Option<String>,
+    tenancy_pool_headroom: f32,
+    tenancy_pool_size: Option<u32>,
+    tenancy_resync_secs: u64,
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
@@ -651,6 +657,12 @@ impl Router {
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .require_routing_key(self.require_routing_key)
+            .maybe_tenancy_keys_configmap(self.tenancy_keys_configmap.as_ref())
+            .tenancy_alloc_configmap(self.tenancy_alloc_configmap.clone())
+            .maybe_tenancy_namespace(self.tenancy_namespace.as_ref())
+            .tenancy_pool_headroom(self.tenancy_pool_headroom)
+            .maybe_tenancy_pool_size(self.tenancy_pool_size)
+            .tenancy_resync_secs(self.tenancy_resync_secs)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
@@ -723,6 +735,12 @@ impl Router {
         retry_jitter_factor = 0.2,
         disable_retries = false,
         require_routing_key = false,
+        tenancy_keys_configmap = None,
+        tenancy_alloc_configmap = "smg-tenant-alloc".to_string(),
+        tenancy_namespace = None,
+        tenancy_pool_headroom = 0.8,
+        tenancy_pool_size = None,
+        tenancy_resync_secs = 30,
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
@@ -817,6 +835,12 @@ impl Router {
         retry_jitter_factor: f32,
         disable_retries: bool,
         require_routing_key: bool,
+        tenancy_keys_configmap: Option<String>,
+        tenancy_alloc_configmap: String,
+        tenancy_namespace: Option<String>,
+        tenancy_pool_headroom: f32,
+        tenancy_pool_size: Option<u32>,
+        tenancy_resync_secs: u64,
         cb_failure_threshold: u32,
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
@@ -924,6 +948,12 @@ impl Router {
             retry_jitter_factor,
             disable_retries,
             require_routing_key,
+            tenancy_keys_configmap,
+            tenancy_alloc_configmap,
+            tenancy_namespace,
+            tenancy_pool_headroom,
+            tenancy_pool_size,
+            tenancy_resync_secs,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,

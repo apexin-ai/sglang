@@ -20,11 +20,12 @@ pub mod pool;
 pub mod source;
 pub mod store;
 pub mod types;
+pub mod wiring;
 
 pub use manager::TenantManager;
 pub use types::{
-    AllocTable, KeyId, KeyRole, PoolSnapshot, Quota, QuotaDecision, TenantCtx, TenantId,
-    TenantKey, TenantSnapshot, TenantSpec, TenantTable,
+    AllocTable, KeyId, KeyRole, PoolSnapshot, Quota, QuotaDecision, TenantCtx, TenantId, TenantKey,
+    TenantSnapshot, TenantSpec, TenantTable,
 };
 
 /// Runtime configuration for the tenancy module; `None` anywhere disables it.

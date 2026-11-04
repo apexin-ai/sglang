@@ -201,7 +201,10 @@ fn install_document(manager: &TenantManager, yaml: &str, resource_version: Strin
         }
         Err(e) => {
             counter!("smg_tenancy_key_reload_total", "result" => "parse_error").increment(1);
-            error!("Tenancy key ConfigMap rejected, keeping previous table: {}", e);
+            error!(
+                "Tenancy key ConfigMap rejected, keeping previous table: {}",
+                e
+            );
         }
     }
 }
@@ -285,13 +288,10 @@ impl KeySource for ConfigMapKeySource {
                         let manager = Arc::clone(&inner);
                         async move {
                             match document_of(&cm) {
-                                Some((yaml, version)) => {
-                                    install_document(&manager, &yaml, version)
+                                Some((yaml, version)) => install_document(&manager, &yaml, version),
+                                None => {
+                                    warn!("Tenancy key ConfigMap has no {:?} entry", KEY_DOCUMENT)
                                 }
-                                None => warn!(
-                                    "Tenancy key ConfigMap has no {:?} entry",
-                                    KEY_DOCUMENT
-                                ),
                             }
                             Ok(())
                         }
@@ -373,7 +373,10 @@ tenants:
         assert_eq!(spec.quota.initial, 32);
         assert_eq!(spec.quota.ceiling, 64);
 
-        let key = table.by_hash.get(&super::super::types::hash_key("secret-a2")).unwrap();
+        let key = table
+            .by_hash
+            .get(&super::super::types::hash_key("secret-a2"))
+            .unwrap();
         assert_eq!(key.role, KeyRole::Admin);
         assert!(key.disabled);
         assert_eq!(key.tenant.as_ref(), "team-a");
@@ -421,7 +424,8 @@ tenants:
 
     #[test]
     fn rejects_inconsistent_quota() {
-        let doc = "tenants:\n  - id: a\n    keys: []\n    quota: {initial: 99, floor: 0, ceiling: 8}\n";
+        let doc =
+            "tenants:\n  - id: a\n    keys: []\n    quota: {initial: 99, floor: 0, ceiling: 8}\n";
         assert!(parse_key_table(doc, String::new())
             .unwrap_err()
             .contains("outside"));

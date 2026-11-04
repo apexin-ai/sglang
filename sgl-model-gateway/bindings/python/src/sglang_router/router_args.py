@@ -67,6 +67,12 @@ class RouterArgs:
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
     require_routing_key: bool = False
+    tenancy_keys_configmap: Optional[str] = None
+    tenancy_alloc_configmap: str = "smg-tenant-alloc"
+    tenancy_namespace: Optional[str] = None
+    tenancy_pool_headroom: float = 0.8
+    tenancy_pool_size: Optional[int] = None
+    tenancy_resync_secs: int = 30
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -370,6 +376,42 @@ class RouterArgs:
                 "Reject data-plane requests without an X-SMG-Routing-Key header. "
                 "Without one the session-affinity policies pick a random worker."
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-keys-configmap",
+            type=str,
+            default=None,
+            help="ConfigMap holding the tenant key table; setting it turns tenancy on",
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-alloc-configmap",
+            type=str,
+            default=RouterArgs.tenancy_alloc_configmap,
+            help="ConfigMap the gateway writes tenant allocations back to",
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-namespace",
+            type=str,
+            default=None,
+            help="Namespace of both tenancy ConfigMaps",
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-pool-headroom",
+            type=float,
+            default=RouterArgs.tenancy_pool_headroom,
+            help="Share of the workers' combined capacity offered to tenants",
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-pool-size",
+            type=int,
+            default=None,
+            help="Fixed tenant pool size; when set, worker capacity is not consulted",
+        )
+        routing_group.add_argument(
+            f"--{prefix}tenancy-resync-secs",
+            type=int,
+            default=RouterArgs.tenancy_resync_secs,
+            help="Full resync period for the tenancy ConfigMap watches",
         )
         routing_group.add_argument(
             f"--{prefix}enable-igw",

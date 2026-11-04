@@ -387,6 +387,31 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     require_routing_key: bool,
 
+    // ==================== Tenancy ====================
+    /// ConfigMap holding the tenant key table. Setting it turns tenancy on.
+    #[arg(long, help_heading = "Tenancy")]
+    tenancy_keys_configmap: Option<String>,
+
+    /// ConfigMap the gateway writes tenant allocations back to.
+    #[arg(long, default_value = "smg-tenant-alloc", help_heading = "Tenancy")]
+    tenancy_alloc_configmap: String,
+
+    /// Namespace of both tenancy ConfigMaps.
+    #[arg(long, help_heading = "Tenancy")]
+    tenancy_namespace: Option<String>,
+
+    /// Share of the workers' combined capacity offered to tenants.
+    #[arg(long, default_value_t = 0.8, help_heading = "Tenancy")]
+    tenancy_pool_headroom: f32,
+
+    /// Fixed tenant pool size; when set, worker capacity is not consulted.
+    #[arg(long, help_heading = "Tenancy")]
+    tenancy_pool_size: Option<u32>,
+
+    /// Full resync period for the tenancy ConfigMap watches.
+    #[arg(long, default_value_t = 30, help_heading = "Tenancy")]
+    tenancy_resync_secs: u64,
+
     // ==================== Circuit Breaker ====================
     /// Number of failures before circuit opens
     #[arg(long, default_value_t = 10, help_heading = "Circuit Breaker")]
@@ -1077,6 +1102,12 @@ impl CliArgs {
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .require_routing_key(self.require_routing_key)
+            .maybe_tenancy_keys_configmap(self.tenancy_keys_configmap.as_ref())
+            .tenancy_alloc_configmap(self.tenancy_alloc_configmap.clone())
+            .maybe_tenancy_namespace(self.tenancy_namespace.as_ref())
+            .tenancy_pool_headroom(self.tenancy_pool_headroom)
+            .maybe_tenancy_pool_size(self.tenancy_pool_size)
+            .tenancy_resync_secs(self.tenancy_resync_secs)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
