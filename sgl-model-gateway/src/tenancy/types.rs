@@ -77,21 +77,11 @@ impl std::fmt::Debug for TenantKey {
 
 /// Bounds a tenant may move its allocation within. `initial` seeds the
 /// allocation when no persisted value exists.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Quota {
     pub initial: u32,
     pub floor: u32,
     pub ceiling: u32,
-}
-
-impl Default for Quota {
-    fn default() -> Self {
-        Self {
-            initial: 0,
-            floor: 0,
-            ceiling: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
