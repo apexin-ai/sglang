@@ -2576,7 +2576,9 @@ class ReasoningParser:
         return ret.reasoning_text, ret.normal_text
 
     def _observe_output_ids(self, output_ids: List[int]) -> None:
-        if not self.detector.wants_output_ids:
+        # Detectors outside BaseReasoningFormatDetector (response-template,
+        # beam) have no output-id hooks; they keep matching by text.
+        if not getattr(self.detector, "wants_output_ids", False):
             return
         self._observed_output_ids.extend(output_ids)
         self.detector.observe_output_ids(output_ids)
@@ -2584,7 +2586,8 @@ class ReasoningParser:
     def _locate_content(self, normal_text: str) -> None:
         if self._content_ids_start is not None or not normal_text:
             return
-        ids = self.detector.output_ids_of(normal_text)
+        output_ids_of = getattr(self.detector, "output_ids_of", None)
+        ids = output_ids_of(normal_text) if output_ids_of is not None else None
         self._content_ids_start = (
             -1 if ids is None else len(self._observed_output_ids) - len(ids)
         )

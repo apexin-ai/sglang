@@ -186,7 +186,9 @@ class FunctionCallParser:
         """Take the token ids that decode to the text parsed next: all of it
         before ``parse_non_stream`` or ``has_tool_call``, a chunk's before
         ``parse_stream_chunk``."""
-        if output_ids is not None and self.detector.wants_output_ids:
+        if output_ids is not None and getattr(
+            self.detector, "wants_output_ids", False
+        ):
             self.detector.observe_output_ids(output_ids)
 
     def observe_stream_output_ids(
