@@ -10,6 +10,8 @@ pub use reasoning_parser;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+#[cfg(feature = "tenancy")]
+pub mod tenancy;
 pub use llm_tokenizer as tokenizer;
 pub use tool_parser;
 pub mod version;

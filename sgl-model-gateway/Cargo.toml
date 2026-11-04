@@ -11,6 +11,9 @@ edition = "2021"
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
+# Per-tenant identity and concurrency accounting; off by default so the
+# community auth paths are the only thing built.
+tenancy = []
 
 vendored-openssl = ["openssl/vendored"]
 
