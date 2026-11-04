@@ -26,6 +26,14 @@ pub struct TenancyRuntime {
     pub enforce: bool,
 }
 
+/// kube's rustls client needs a process-wide `CryptoProvider`, and the crate
+/// pulls in more than one backend, so it cannot pick one itself. Idempotent:
+/// installing over an existing provider fails and that is fine.
+/// `service_discovery` has the same requirement on its own `Client::try_default`.
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Builds the runtime when a key ConfigMap is configured, otherwise `None`.
 ///
 /// `enforce` is derived rather than configured: with no community data-plane
@@ -49,6 +57,7 @@ pub async fn build(config: &RouterConfig) -> Option<TenancyRuntime> {
     };
     let enforce = tenancy_config.enforce;
 
+    ensure_crypto_provider();
     let client = match Client::try_default().await {
         Ok(client) => client,
         Err(e) => {
