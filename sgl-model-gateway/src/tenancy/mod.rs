@@ -15,6 +15,7 @@ pub mod api;
 pub mod auth;
 pub mod gate;
 pub mod manager;
+pub mod metrics;
 pub mod pool;
 pub mod source;
 pub mod store;
