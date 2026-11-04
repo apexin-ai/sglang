@@ -41,6 +41,10 @@ pub struct TenancyConfig {
     pub pool_size_override: Option<u32>,
     /// Full resync period backing up the watch stream.
     pub resync_secs: u64,
+    /// Reject a request this table does not identify. Required whenever no
+    /// community data-plane key is set, since that path then admits everyone
+    /// and unidentified traffic would escape accounting entirely.
+    pub enforce: bool,
 }
 
 impl Default for TenancyConfig {
@@ -52,6 +56,7 @@ impl Default for TenancyConfig {
             pool_headroom: 0.8,
             pool_size_override: None,
             resync_secs: 30,
+            enforce: false,
         }
     }
 }
