@@ -15,6 +15,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     moe_unpermute,
 )
 from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -27,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -229,8 +231,10 @@ class HummingRunnerCore(MoeRunnerCore):
         if expected_m is not None:
             return expected_m * self.num_experts
 
-        # TODO: update for EP and DP
-        return topk_ids.nelement()
+        # Under EP only this rank's slice of experts sees rows; assume uniform routing
+        # (a device count would sync). Overestimating M picks a large block and pads
+        # each expert's few decode rows to it, which makes the GEMM compute-bound.
+        return max(1, topk_ids.nelement() * self.num_experts // self.global_num_experts)
 
     def get_buffer_metas(
         self,
@@ -450,6 +454,10 @@ class HummingRunnerCore(MoeRunnerCore):
             if token_scales is None:
                 raise ValueError(f"Humming {sublayer_name} requires {scale_name}")
 
+        fast = self._fast_group_quant(inputs, sublayer_name, quanted_input, quant_mode)
+        if fast is not None:
+            return fast
+
         inputs, group_scales, token_scales = HummingMethod.may_process_input(
             layer=self.layer,
             inputs=inputs,
@@ -462,6 +470,39 @@ class HummingRunnerCore(MoeRunnerCore):
         input_scale = group_scales if quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if quant_mode.has_secondary_scale else None
         return inputs, input_scale, input_scale_2
+
+    def _fast_group_quant(
+        self,
+        inputs: torch.Tensor,
+        sublayer_name: str,
+        quanted_input: torch.Tensor | None,
+        quant_mode: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, None] | None:
+        """SGLang's group-quant kernel for the plain dynamic-group FP8 case, else None.
+
+        humming's quant_input launches one program per group, which costs ~50us on decode
+        batches below 131072 groups; sglang's kernel emits the same row-major fp32 group
+        scales and e4m3 values within 1 ulp. Only the mode this kernel reproduces exactly
+        takes the fast path -- a tensor or secondary scale, a Hadamard transform or a
+        non-fp32 scale dtype all fall through to humming.
+        """
+        if not get_platform().is_sm90 or quant_mode.has_tensor_scale:
+            return None
+        if self._get_hadamard_block_size(sublayer_name) > 1:
+            return None
+        schema = self.layer.input_schemas[sublayer_name]
+        group_size = schema.input_scale_group_size
+        if str(schema.a_dtype) != "float8e4m3" or group_size <= 0:
+            return None
+        if str(schema.input_scale_dtype) not in ("float32", "None"):
+            return None
+        x = inputs.view(-1, inputs.size(-1))
+        quanted, group_scales = sglang_per_token_group_quant_fp8(
+            x,
+            group_size,
+            output_q=quanted_input.view(x.shape) if quanted_input is not None else None,
+        )
+        return quanted, group_scales, None
 
     def _get_hadamard_block_size(self, sublayer_name: str) -> int:
         weight_schemas = getattr(self.layer, "weight_schemas", {})
