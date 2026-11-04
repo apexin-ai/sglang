@@ -8,6 +8,7 @@ pub mod policies;
 pub use openai_protocol as protocols;
 pub use reasoning_parser;
 pub mod routers;
+pub mod routing_key_guard;
 pub mod server;
 pub mod service_discovery;
 #[cfg(feature = "tenancy")]

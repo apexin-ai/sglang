@@ -581,6 +581,12 @@ pub fn build_app(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
         ))
+        // Outside the concurrency limit: a request missing its key is refused
+        // before it can take a slot or queue behind one.
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.context.router_config.require_routing_key,
+            crate::routing_key_guard::require_routing_key_middleware,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,

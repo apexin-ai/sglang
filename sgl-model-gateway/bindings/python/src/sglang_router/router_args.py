@@ -66,6 +66,7 @@ class RouterArgs:
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
+    require_routing_key: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -361,6 +362,14 @@ class RouterArgs:
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
+        )
+        routing_group.add_argument(
+            f"--{prefix}require-routing-key",
+            action="store_true",
+            help=(
+                "Reject data-plane requests without an X-SMG-Routing-Key header. "
+                "Without one the session-affinity policies pick a random worker."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}enable-igw",

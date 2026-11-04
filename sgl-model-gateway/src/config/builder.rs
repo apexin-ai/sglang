@@ -479,6 +479,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn require_routing_key(mut self, enable: bool) -> Self {
+        self.config.require_routing_key = enable;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

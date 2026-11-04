@@ -59,6 +59,10 @@ pub struct RouterConfig {
     #[serde(default)]
     pub disable_circuit_breaker: bool,
     pub health_check: HealthCheckConfig,
+    /// Reject data-plane requests without an `X-SMG-Routing-Key`. Without one
+    /// the session-affinity policies fall back to a random worker.
+    #[serde(default)]
+    pub require_routing_key: bool,
     #[serde(default)]
     pub enable_igw: bool,
     /// Can be a HuggingFace model ID or local path
@@ -538,6 +542,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            require_routing_key: false,
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             model_path: None,

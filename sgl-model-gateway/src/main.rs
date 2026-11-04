@@ -382,6 +382,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Retry Configuration")]
     disable_retries: bool,
 
+    /// Reject data-plane requests that carry no X-SMG-Routing-Key. Without one
+    /// the session-affinity policies fall back to a random worker.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    require_routing_key: bool,
+
     // ==================== Circuit Breaker ====================
     /// Number of failures before circuit opens
     #[arg(long, default_value_t = 10, help_heading = "Circuit Breaker")]
@@ -1071,6 +1076,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .require_routing_key(self.require_routing_key)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)

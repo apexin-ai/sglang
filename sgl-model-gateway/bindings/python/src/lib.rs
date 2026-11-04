@@ -397,6 +397,7 @@ struct Router {
     retry_backoff_multiplier: f32,
     retry_jitter_factor: f32,
     disable_retries: bool,
+    require_routing_key: bool,
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
@@ -649,6 +650,7 @@ impl Router {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .require_routing_key(self.require_routing_key)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
@@ -720,6 +722,7 @@ impl Router {
         retry_backoff_multiplier = 1.5,
         retry_jitter_factor = 0.2,
         disable_retries = false,
+        require_routing_key = false,
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
@@ -813,6 +816,7 @@ impl Router {
         retry_backoff_multiplier: f32,
         retry_jitter_factor: f32,
         disable_retries: bool,
+        require_routing_key: bool,
         cb_failure_threshold: u32,
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
@@ -919,6 +923,7 @@ impl Router {
             retry_backoff_multiplier,
             retry_jitter_factor,
             disable_retries,
+            require_routing_key,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,
