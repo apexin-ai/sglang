@@ -305,4 +305,3 @@ spec:
   selector: {app: qwen38-base-tenant-router, role: router}
   ports:
   - {name: http, port: 30000, targetPort: 30000}
-  - {name: http-metrics, port: 29000, targetPort: 29000}

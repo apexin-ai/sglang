@@ -66,10 +66,6 @@ spec:
       port: 30000
       targetPort: 30000
       protocol: TCP
-    - name: metrics
-      port: 29000
-      targetPort: 29000
-      protocol: TCP
 ---
 apiVersion: apps/v1
 kind: Deployment
