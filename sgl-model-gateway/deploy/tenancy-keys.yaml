@@ -39,6 +39,11 @@ data:
         keys:
           - {id: l1, secret: "sk-lewei-1697", role: user}
 
+      - id: yufan
+        name: "yufan"
+        keys:
+          - {id: y1, secret: "sk-yufan-1420", role: user}
+
       - id: ops
         name: "Ops"
         keys:
