@@ -27,16 +27,21 @@ data:
   tenants.yaml: |
     version: 1
     tenants:
-      - id: team-a
-        name: "Team A"
+      # No quota block: unlimited concurrency, the default.
+      - id: chengsong
+        name: "chengsong"
         keys:
-          - {id: a1, secret: "tenancy-test-key-a", role: user}
-        quota: {initial: 8, floor: 2, ceiling: 32}
-      - id: team-b
-        name: "Team B"
+          - {id: a1, secret: "sk-chengsong-1012", role: user}
+
+      - id: sunzhen
+        name: "sunzhen"
         keys:
-          - {id: b1, secret: "tenancy-test-key-b", role: admin}
-        quota: {initial: 4, floor: 1, ceiling: 16}
+          - {id: s1, secret: "sk-sunzhen-1646", role: user}
+
+      - id: ops
+        name: "Ops"
+        keys:
+          - {id: ops1, secret: "sk-admin-ops", role: admin}
 ---
 # No `data`: the gateway owns the contents, and leaving it out keeps a re-apply
 # of this file from resetting live allocations.

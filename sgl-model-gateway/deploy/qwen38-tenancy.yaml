@@ -1,0 +1,308 @@
+# Multi-tenant Qwen3.8 stack on H20: workers plus a tenancy-aware router.
+#
+#   kubectl -n infer apply -f qwen38-tenancy.yaml
+#
+# To run this for another model, replace the prefix `qwen38-base-tenant-` throughout
+# and change the values marked PER-MODEL. Everything named without that prefix
+# is shared by every tenancy router in the namespace and stays as it is.
+#
+# PER-MODEL (not covered by the prefix replacement):
+#   1. namespace            infer
+#   2. serviceAccountName   dsv41-b300-router   (an account that can read pods)
+#   3. model path and the sglang flags on the worker
+#   4. the JIT cache host path, shared with the earlier qwen38-h20 workers so a
+#      first start is not cold
+#
+# This is a self-contained stack: applying it starts 4 workers at 4 GPUs each,
+# 16 GPUs in total, beside anything already running. To attach a tenancy router
+# to workers that already exist instead, drop the worker Deployment and point
+# --selector at their labels.
+#
+# PREREQUISITE: the tenancy-enabled wheel must sit on CPFS at the path in WHEEL
+# below (bmcpfs:/dsf-infer-opt/smg-tenancy/). CPFS is reachable from every H20
+# node, so neither pod is pinned to a machine. The image's own
+# sglang-router is replaced at startup; the published image lacks the feature.
+#
+# Quota semantics: a tenant with no `quota:` block is unlimited. Adding one sets
+# a concurrency cap, which today is accounted and exported as metrics but not
+# enforced -- an over-cap request is still served. Nothing here limits request
+# rate; quota is about concurrency only.
+---
+# ===== Shared: one per namespace, reused by every tenancy router =====
+#
+# Reading ConfigMaps is the same grant for every model, so this Role carries no
+# model name. Writing is not here: an allocation table is per-model and gets its
+# own Role below, so one router cannot overwrite another's allocations.
+#
+# list/watch cannot be restricted by resourceNames, and neither can get once
+# several key tables share this Role; each router narrows its own watch
+# client-side by a metadata.name field selector.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smg-tenancy-read
+  namespace: infer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smg-tenancy-read
+  namespace: infer
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: smg-tenancy-read}
+subjects:
+  # PER-MODEL: an existing account that already reads pods for service
+  # discovery. qwen38-ep5-router runs under this one today.
+  - {kind: ServiceAccount, name: qwen36-dp-router, namespace: infer}
+---
+# ===== Per-model: everything below is prefixed qwen38-base-tenant- =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-base-tenant-worker
+  namespace: infer
+  labels: {app: qwen38-base-tenant-worker, role: worker}
+spec:
+  replicas: 4
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: qwen38-base-tenant-worker, role: worker}
+  template:
+    metadata:
+      labels: {app: qwen38-base-tenant-worker, role: worker}
+    spec:
+      nodeSelector:
+        aliyun.accelerator/nvidia_name: NVIDIA-H20-3e
+      tolerations:
+      - {effect: NoSchedule, key: node-role.alibabacloud.com/lingjun, operator: Exists}
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels: {app: qwen38-base-tenant-worker, role: worker}
+      # sglang is PID 1 via exec, so SIGTERM reaches it; in-flight requests get
+      # up to 120s to drain before the kubelet kills the container.
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: sglang
+        # Cached on the H20 nodes; its transformers 5.19 resolves the qwen4_exp
+        # tokenizer correctly, so the B300 tokenizer workaround is not needed.
+        image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261026-8252e3af
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          # Triton MoE configs tuned on H20-3e for this model's expert shapes
+          # (E=512 N=160 under TP4). Measured 2026-11-04 against the untuned
+          # build at 7.7k in / 1k out: c=1 decode 199 -> 228 tok/s, c=8 90 -> 92.
+          # The directory name must match the image's triton version (3.8.0).
+          D=/sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_8_0
+          mkdir -p "$D"
+          cp /cpfs/dongshaofei/sglang-moe-configs/*.json "$D"/
+          exec sglang serve \
+            --model-path /cpfs/models/Qwen3.8-Flash-Next \
+            --served-model-name Qwen3.8-Flash-Next \
+            --tp 4 \
+            --mem-fraction-static 0.85 \
+            --chunked-prefill-size 8192 \
+            --linear-attn-prefill-backend flashinfer \
+            --linear-attn-decode-backend flashinfer \
+            --linear-attn-verify-backend triton \
+            --mamba-ssm-dtype bfloat16 \
+            --kv-cache-dtype fp8_e4m3 \
+            --qsa-indexer-dtype fp8_e4m3 \
+            --speculative-algorithm NEXTN \
+            --speculative-num-steps 3 \
+            --speculative-eagle-topk 1 \
+            --speculative-num-draft-tokens 4 \
+            --max-running-requests 96 \
+            --context-length 262144 \
+            --reasoning-parser auto \
+            --tool-call-parser auto \
+            --enable-metrics \
+            --host 0.0.0.0 \
+            --port 30000
+        ports:
+        - {name: http, containerPort: 30000}
+        readinessProbe:
+          httpGet: {path: /health, port: 30000}
+          periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 5
+        resources:
+          # No privileged mode: it exposes all 8 GPUs and two TP4 pods on one node then collide.
+          limits: {cpu: "48", memory: 500Gi, nvidia.com/gpu: "4"}
+          requests: {cpu: "48", memory: 500Gi, nvidia.com/gpu: "4"}
+        volumeMounts:
+        - {name: cpfs, mountPath: /cpfs/, readOnly: true}
+        - {name: jit, mountPath: /root/.cache, subPath: dot-cache}
+        - {name: jit, mountPath: /root/.triton, subPath: triton}
+        - {name: shm, mountPath: /dev/shm}
+      volumes:
+      - name: cpfs
+        persistentVolumeClaim: {claimName: bmcpfs, readOnly: true}
+      # PER-MODEL: the qwen38 path on purpose, so these workers reuse the JIT /
+      # triton caches the earlier qwen38-h20 workers warmed on these nodes.
+      - name: jit
+        hostPath: {path: /mnt/nvme/jit-cache/qwen38, type: DirectoryOrCreate}
+      - name: shm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
+---
+# Write access to this model's allocation table only. The key table stays
+# read-only everywhere: a gateway that could write it could mint itself an
+# admin key.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: qwen38-base-tenant-alloc-writer
+  namespace: infer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["qwen38-base-tenant-alloc"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: qwen38-base-tenant-alloc-writer
+  namespace: infer
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: qwen38-base-tenant-alloc-writer}
+subjects:
+  - {kind: ServiceAccount, name: qwen36-dp-router, namespace: infer}
+---
+# Secrets are plaintext: anyone who can read ConfigMaps in this namespace can
+# read them. `role: admin` only unlocks GET /tenants; it grants no capacity.
+# Edit this ConfigMap to add tenants or rotate keys -- the router reloads within
+# seconds, and a document that fails to parse leaves the previous table in force
+# rather than locking everyone out.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen38-base-tenant-keys
+  namespace: infer
+  labels: {app: qwen38-base-tenant-router}
+data:
+  tenants.yaml: |
+    version: 1
+    tenants:
+      # No quota block: unlimited concurrency, the default.
+      - id: chengsong
+        name: "chengsong"
+        keys:
+          - {id: a1, secret: "sk-chengsong-1012", role: user}
+
+      - id: sunzhen
+        name: "sunzhen"
+        keys:
+          - {id: s1, secret: "sk-sunzhen-1646", role: user}
+
+      - id: ops
+        name: "Ops"
+        keys:
+          - {id: ops1, secret: "sk-admin-ops", role: admin}
+
+      # To cap a tenant's concurrency, give it a quota block. initial seeds the
+      # allocation, floor is what a pool shrink may not take away, and ceiling is
+      # how far the tenant may grow itself through POST /tenants/self/quota:
+      #
+      # - id: batch
+      #   name: "Batch jobs"
+      #   keys:
+      #     - {id: batch1, secret: "CHANGE-ME-batch", role: user}
+      #   quota: {initial: 16, floor: 4, ceiling: 48}
+---
+# No `data`: the gateway owns the contents. Leaving it out means re-applying
+# this file does not reset allocations it has written.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen38-base-tenant-alloc
+  namespace: infer
+  labels: {app: qwen38-base-tenant-router}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-base-tenant-router
+  namespace: infer
+  labels: {app: qwen38-base-tenant-router, role: router}
+spec:
+  replicas: 1   # manual policy keeps the session->worker table in process memory; do not run 2 replicas
+  selector:
+    matchLabels: {app: qwen38-base-tenant-router, role: router}
+  template:
+    metadata:
+      labels: {app: qwen38-base-tenant-router, role: router}
+    spec:
+      # PER-MODEL: see the header.
+      serviceAccountName: qwen36-dp-router
+      nodeSelector:
+        aliyun.accelerator/nvidia_name: NVIDIA-H20-3e
+      tolerations:
+      - {effect: NoSchedule, key: node-role.alibabacloud.com/lingjun, operator: Exists}
+      volumes:
+      - name: cpfs
+        persistentVolumeClaim: {claimName: bmcpfs, readOnly: true}
+      containers:
+      - name: router
+        image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261026-8252e3af
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          WHEEL=/cpfs/dsf-infer-opt/smg-tenancy/sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl
+          sha256sum "$WHEEL"
+          python3 -m pip install --no-deps --force-reinstall "$WHEEL"
+          exec python3 -m sglang_router.launch_router \
+            --service-discovery \
+            --selector app=qwen38-base-tenant-worker role=worker \
+            --service-discovery-port 30000 \
+            --service-discovery-namespace infer \
+            --policy manual \
+            --assignment-mode min_group \
+            --worker-startup-timeout-secs 3600 \
+            --request-timeout-secs 10800 \
+            --require-routing-key \
+            --tenancy-namespace infer \
+            --tenancy-keys-configmap qwen38-base-tenant-keys \
+            --tenancy-alloc-configmap qwen38-base-tenant-alloc \
+            --tenancy-pool-headroom 0.8 \
+            --prometheus-host 0.0.0.0 \
+            --prometheus-port 29000 \
+            --host 0.0.0.0 \
+            --port 30000
+        ports:
+        - {name: http, containerPort: 30000}
+        - {name: http-metrics, containerPort: 29000}
+        readinessProbe:
+          httpGet: {path: /health, port: 30000}
+          periodSeconds: 10
+          timeoutSeconds: 10
+        resources:
+          limits: {cpu: "16", memory: 32Gi}
+          requests: {cpu: "16", memory: 32Gi}
+        volumeMounts:
+        - {name: cpfs, mountPath: /cpfs/, readOnly: true}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen38-base-tenant-router
+  namespace: infer
+  labels: {app: qwen38-base-tenant-router}
+spec:
+  type: NodePort
+  selector: {app: qwen38-base-tenant-router, role: router}
+  ports:
+  - {name: http, port: 30000, targetPort: 30000}
+  - {name: http-metrics, port: 29000, targetPort: 29000}
