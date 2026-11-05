@@ -41,6 +41,8 @@ pub struct ReleaseRequest {
 /// Resolves a grow or shrink against the tenant bounds and the free pool.
 /// `allocated_sum` includes `current`, so the free pool excludes what this
 /// tenant already holds.
+/// `None` back from the caller's quota lookup means the tenant is unlimited;
+/// callers must not reach here in that case.
 pub fn decide_resize(
     current: u32,
     desired: u32,
@@ -108,8 +110,24 @@ fn snapshot_of(manager: &TenantManager, tenant: &TenantId) -> Option<TenantSnaps
         allocated: manager.allocated(tenant),
         inflight: manager.inflight_counter(tenant).load(Ordering::Relaxed),
         quota: spec.quota,
+        limited: spec.quota.is_some(),
         over_quota_total: manager.over_quota_counter(tenant).load(Ordering::Relaxed),
     })
+}
+
+/// A quota-less tenant has nothing for self-service resize to bound against.
+fn unlimited_tenant(tenant: &TenantId) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": format!(
+                "tenant {} has no quota configured and is unlimited; self-service \
+                 resize does not apply",
+                tenant
+            )
+        })),
+    )
+        .into_response()
 }
 
 fn unknown_tenant(tenant: &TenantId) -> Response {
@@ -184,8 +202,11 @@ async fn set_quota(
         Some(spec) => spec.quota,
         None => return unknown_tenant(&ctx.tenant),
     };
+    let Some(quota) = quota else {
+        return unlimited_tenant(&ctx.tenant);
+    };
     let pool = manager.pool_snapshot();
-    let current = manager.allocated(&ctx.tenant);
+    let current = manager.allocated(&ctx.tenant).unwrap_or(0);
     let decision = decide_resize(current, req.desired, &quota, pool.total, pool.allocated);
     commit(&store, &ctx.tenant, decision).await
 }
@@ -200,7 +221,10 @@ async fn release_quota(
         Some(spec) => spec.quota,
         None => return unknown_tenant(&ctx.tenant),
     };
-    let current = manager.allocated(&ctx.tenant);
+    let Some(quota) = quota else {
+        return unlimited_tenant(&ctx.tenant);
+    };
+    let current = manager.allocated(&ctx.tenant).unwrap_or(0);
     let decision = decide_release(current, req.amount, &quota);
     commit(&store, &ctx.tenant, decision).await
 }
@@ -244,15 +268,15 @@ mod tests {
         }
     }
 
-    fn quota(initial: u32, floor: u32, ceiling: u32) -> Quota {
-        Quota {
+    fn quota(initial: u32, floor: u32, ceiling: u32) -> Option<Quota> {
+        Some(Quota {
             initial,
             floor,
             ceiling,
-        }
+        })
     }
 
-    fn store_with_tenants(specs: &[(&str, Quota)], pool: u32) -> Arc<AllocStore> {
+    fn store_with_tenants(specs: &[(&str, Option<Quota>)], pool: u32) -> Arc<AllocStore> {
         let manager = TenantManager::new(TenancyConfig::default());
         let mut tenants = HashMap::new();
         for (id, q) in specs {
@@ -291,7 +315,7 @@ mod tests {
     #[test]
     fn grow_is_capped_by_the_free_pool() {
         // 100 total, 94 already handed out: only 6 of the 20 asked for are free.
-        let d = decide_resize(10, 30, &quota(10, 0, 64), 100, 94);
+        let d = decide_resize(10, 30, &quota(10, 0, 64).unwrap(), 100, 94);
         assert_eq!(d.granted, 16);
         assert_eq!(d.requested, 30);
         assert_eq!(d.reason, "capped_by_pool");
@@ -299,32 +323,32 @@ mod tests {
 
     #[test]
     fn grow_is_capped_by_the_ceiling() {
-        let d = decide_resize(10, 999, &quota(10, 0, 32), 1000, 10);
+        let d = decide_resize(10, 999, &quota(10, 0, 32).unwrap(), 1000, 10);
         assert_eq!(d.granted, 32);
         assert_eq!(d.reason, "capped_by_ceiling");
     }
 
     #[test]
     fn full_grant_reports_granted() {
-        let d = decide_resize(10, 20, &quota(10, 0, 64), 100, 10);
+        let d = decide_resize(10, 20, &quota(10, 0, 64).unwrap(), 100, 10);
         assert_eq!(d.granted, 20);
         assert_eq!(d.reason, "granted");
     }
 
     #[test]
     fn shrink_through_set_quota_needs_no_pool_room() {
-        let d = decide_resize(40, 8, &quota(10, 4, 64), 40, 40);
+        let d = decide_resize(40, 8, &quota(10, 4, 64).unwrap(), 40, 40);
         assert_eq!(d.granted, 8);
         assert_eq!(d.reason, "granted");
     }
 
     #[test]
     fn release_is_floored() {
-        let d = decide_release(10, 9, &quota(10, 4, 64));
+        let d = decide_release(10, 9, &quota(10, 4, 64).unwrap());
         assert_eq!(d.granted, 4);
         assert_eq!(d.reason, "capped_by_floor");
 
-        let d = decide_release(10, 2, &quota(10, 4, 64));
+        let d = decide_release(10, 2, &quota(10, 4, 64).unwrap());
         assert_eq!(d.granted, 8);
         assert_eq!(d.reason, "granted");
     }
@@ -350,8 +374,8 @@ mod tests {
         assert_eq!(body_json(resp).await["granted"], 20);
 
         let manager = store.manager();
-        assert_eq!(manager.allocated(&Arc::from("team-a")), 20);
-        assert_eq!(manager.allocated(&Arc::from("victim")), 4);
+        assert_eq!(manager.allocated(&Arc::from("team-a")), Some(20));
+        assert_eq!(manager.allocated(&Arc::from("victim")), Some(4));
     }
 
     #[tokio::test]
@@ -367,7 +391,7 @@ mod tests {
             .body(Body::from(r#"{"desired": 16}"#))
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
-        assert_eq!(store.manager().allocated(&Arc::from("team-a")), 16);
+        assert_eq!(store.manager().allocated(&Arc::from("team-a")), Some(16));
     }
 
     #[tokio::test]

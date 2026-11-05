@@ -69,22 +69,29 @@ impl TenantManager {
             .clone()
     }
 
-    /// Allocation currently in force, falling back to the spec's `initial`
-    /// when the alloc ConfigMap has no entry for this tenant yet.
-    pub fn allocated(&self, tenant: &TenantId) -> u32 {
-        if let Some(v) = self.alloc().allocated.get(tenant.as_ref()) {
-            return *v;
-        }
-        self.table()
-            .tenants
-            .get(tenant)
-            .map(|spec| spec.quota.initial)
-            .unwrap_or(0)
+    /// Concurrency cap in force, or `None` when the tenant is unlimited.
+    /// A persisted allocation wins over the spec's `initial`; an unknown or
+    /// quota-less tenant is unlimited.
+    pub fn allocated(&self, tenant: &TenantId) -> Option<u32> {
+        let quota = self.table().tenants.get(tenant)?.quota?;
+        Some(
+            self.alloc()
+                .allocated
+                .get(tenant.as_ref())
+                .copied()
+                .unwrap_or(quota.initial),
+        )
     }
 
     pub fn pool_snapshot(&self) -> PoolSnapshot {
         let total = self.pool_total.load(Ordering::Relaxed);
-        let allocated: u32 = self.table().tenants.keys().map(|t| self.allocated(t)).sum();
+        // Unlimited tenants draw nothing from the pool: there is no number to draw.
+        let allocated: u32 = self
+            .table()
+            .tenants
+            .keys()
+            .filter_map(|t| self.allocated(t))
+            .sum();
         PoolSnapshot {
             total,
             allocated,

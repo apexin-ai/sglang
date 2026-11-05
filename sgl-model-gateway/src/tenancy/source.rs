@@ -67,8 +67,8 @@ struct TenantDocument {
     name: String,
     #[serde(default)]
     keys: Vec<KeyDocumentEntry>,
-    #[serde(default)]
-    quota: QuotaDocument,
+    /// Absent means unlimited; a present block caps the tenant's concurrency.
+    quota: Option<QuotaDocument>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,23 +115,29 @@ pub fn parse_key_table(yaml: &str, resource_version: String) -> Result<TenantTab
             return Err(format!("duplicate tenant id {:?}", tenant.id));
         }
 
-        let quota = super::types::Quota {
-            initial: tenant.quota.initial,
-            floor: tenant.quota.floor,
-            ceiling: tenant.quota.ceiling,
+        let quota = match tenant.quota {
+            None => None,
+            Some(doc) => {
+                let quota = super::types::Quota {
+                    initial: doc.initial,
+                    floor: doc.floor,
+                    ceiling: doc.ceiling,
+                };
+                if quota.ceiling < quota.floor {
+                    return Err(format!(
+                        "tenant {:?}: quota ceiling {} is below floor {}",
+                        tenant.id, quota.ceiling, quota.floor
+                    ));
+                }
+                if quota.initial < quota.floor || quota.initial > quota.ceiling {
+                    return Err(format!(
+                        "tenant {:?}: quota initial {} is outside [{}, {}]",
+                        tenant.id, quota.initial, quota.floor, quota.ceiling
+                    ));
+                }
+                Some(quota)
+            }
         };
-        if quota.ceiling < quota.floor {
-            return Err(format!(
-                "tenant {:?}: quota ceiling {} is below floor {}",
-                tenant.id, quota.ceiling, quota.floor
-            ));
-        }
-        if quota.initial < quota.floor || quota.initial > quota.ceiling {
-            return Err(format!(
-                "tenant {:?}: quota initial {} is outside [{}, {}]",
-                tenant.id, quota.initial, quota.floor, quota.ceiling
-            ));
-        }
 
         let mut seen_key_ids = HashMap::new();
         for entry in tenant.keys {
@@ -370,8 +376,8 @@ tenants:
 
         let spec = table.tenants.get("team-a").unwrap();
         assert_eq!(spec.name, "Team A");
-        assert_eq!(spec.quota.initial, 32);
-        assert_eq!(spec.quota.ceiling, 64);
+        assert_eq!(spec.quota.unwrap().initial, 32);
+        assert_eq!(spec.quota.unwrap().ceiling, 64);
 
         let key = table
             .by_hash
@@ -380,6 +386,21 @@ tenants:
         assert_eq!(key.role, KeyRole::Admin);
         assert!(key.disabled);
         assert_eq!(key.tenant.as_ref(), "team-a");
+    }
+
+    #[test]
+    fn a_tenant_with_no_quota_block_is_unlimited() {
+        let doc = r#"
+version: 1
+tenants:
+  - id: team-a
+    name: "Team A"
+    keys:
+      - {id: k1, secret: "secret-a1"}
+"#;
+        let table = parse_key_table(doc, "1".to_string()).unwrap();
+        let spec = table.tenants.get("team-a").unwrap();
+        assert_eq!(spec.quota, None);
     }
 
     #[test]

@@ -75,9 +75,10 @@ impl std::fmt::Debug for TenantKey {
     }
 }
 
-/// Bounds a tenant may move its allocation within. `initial` seeds the
-/// allocation when no persisted value exists.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// A tenant's concurrency cap and the bounds it may move that cap within.
+/// `initial` seeds the allocation when no persisted value exists. A tenant
+/// with no quota at all is unlimited, which is why callers see `Option<Quota>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
     pub initial: u32,
     pub floor: u32,
@@ -88,7 +89,9 @@ pub struct Quota {
 pub struct TenantSpec {
     pub id: TenantId,
     pub name: String,
-    pub quota: Quota,
+    /// `None` means unlimited: no cap is enforced and the tenant draws nothing
+    /// from the pool. This is the default for a tenant with no `quota:` block.
+    pub quota: Option<Quota>,
 }
 
 /// Immutable snapshot of the key ConfigMap, swapped in whole on every reload.
@@ -131,11 +134,14 @@ pub struct PoolSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct TenantSnapshot {
     pub tenant: String,
-    pub allocated: u32,
+    /// Absent when the tenant is unlimited.
+    pub allocated: Option<u32>,
     /// Requests in flight right now, counted until the response body ends.
     pub inflight: u32,
-    pub quota: Quota,
-    /// Times a request started while `inflight >= allocated`. Not enforced yet.
+    pub quota: Option<Quota>,
+    pub limited: bool,
+    /// Requests admitted while already at or above the allocation; always 0
+    /// while unlimited, since there is nothing to be over.
     pub over_quota_total: u64,
 }
 

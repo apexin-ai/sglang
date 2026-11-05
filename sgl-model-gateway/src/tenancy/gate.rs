@@ -1,7 +1,8 @@
 //! WP-B: per-tenant in-flight accounting.
 //!
-//! Observe-only: a request past its tenant's allocation is still served, it only
-//! bumps the over-quota counter. The release has to happen when the response body
+//! A tenant with no quota is unlimited: nothing is compared and nothing is
+//! counted against it. For one that has a cap this stays observe-only -- a
+//! request past the allocation is still served and only bumps the counter. The release has to happen when the response body
 //! ends rather than when the handler returns -- a streamed completion returns from
 //! the handler immediately -- so the guard rides the body and releases on `Drop`,
 //! which also covers a client that disconnects mid-stream.
@@ -32,17 +33,19 @@ pub struct InflightGuard {
 }
 
 impl InflightGuard {
+    /// `allocated` is `None` for an unlimited tenant, which is then never
+    /// counted as over quota.
     pub fn new(
         tenant: Arc<str>,
         key_id: Arc<str>,
         counter: Arc<AtomicU32>,
-        allocated: u32,
+        allocated: Option<u32>,
         over_quota: &Arc<AtomicU64>,
     ) -> Self {
         let now = counter.fetch_add(1, Ordering::Relaxed) + 1;
         metrics::set_tenant_inflight(&tenant, now);
         metrics::record_tenant_request(&tenant, &key_id);
-        if now > allocated {
+        if allocated.is_some_and(|limit| now > limit) {
             over_quota.fetch_add(1, Ordering::Relaxed);
             metrics::record_tenant_over_quota(&tenant);
         }
@@ -228,7 +231,9 @@ pub async fn tenant_inflight_middleware(
 impl TenantManager {
     pub fn inflight_guard(&self, ctx: &TenantCtx) -> InflightGuard {
         let allocated = self.allocated(&ctx.tenant);
-        metrics::set_tenant_allocated(&ctx.tenant, allocated);
+        if let Some(limit) = allocated {
+            metrics::set_tenant_allocated(&ctx.tenant, limit);
+        }
         InflightGuard::new(
             ctx.tenant.clone(),
             ctx.key_id.clone(),
@@ -258,11 +263,11 @@ mod tests {
             TenantSpec {
                 id: id.clone(),
                 name: "team-a".to_string(),
-                quota: Quota {
+                quota: Some(Quota {
                     initial: allocated,
                     floor: 0,
                     ceiling: 64,
-                },
+                }),
             },
         );
         manager.install_table(table);
@@ -306,6 +311,48 @@ mod tests {
             assert_eq!(counter.load(Ordering::Relaxed), 2);
         }
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_unlimited_tenant_is_never_over_quota() {
+        let manager = TenantManager::new(TenancyConfig::default());
+        let id: TenantId = Arc::from("team-free");
+        let mut table = TenantTable::default();
+        table.tenants.insert(
+            id.clone(),
+            TenantSpec {
+                id: id.clone(),
+                name: "team-free".to_string(),
+                quota: None,
+            },
+        );
+        manager.install_table(table);
+        let ctx = TenantCtx {
+            tenant: id,
+            key_id: Arc::from("k1"),
+            role: KeyRole::User,
+        };
+        let guards: Vec<_> = (0..50).map(|_| manager.inflight_guard(&ctx)).collect();
+        assert_eq!(manager.allocated(&ctx.tenant), None);
+        assert_eq!(
+            manager
+                .over_quota_counter(&ctx.tenant)
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            manager
+                .inflight_counter(&ctx.tenant)
+                .load(Ordering::Relaxed),
+            50
+        );
+        drop(guards);
+        assert_eq!(
+            manager
+                .inflight_counter(&ctx.tenant)
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

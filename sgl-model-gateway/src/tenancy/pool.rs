@@ -54,15 +54,16 @@ impl TenantManager {
         self.pool_total.store(total, Ordering::Relaxed);
 
         let table = self.table();
+        // Unlimited tenants have nothing to rescale and nothing to report.
         let current: HashMap<String, u32> = table
             .tenants
             .keys()
-            .map(|t| (t.to_string(), self.allocated(t)))
+            .filter_map(|t| Some((t.to_string(), self.allocated(t)?)))
             .collect();
         let floors: HashMap<String, u32> = table
             .tenants
             .iter()
-            .map(|(id, spec)| (id.to_string(), spec.quota.floor))
+            .filter_map(|(id, spec)| Some((id.to_string(), spec.quota?.floor)))
             .collect();
         for (tenant, allocated) in &current {
             metrics::set_tenant_allocated(tenant, *allocated);
@@ -205,7 +206,7 @@ mod tests {
                 TenantSpec {
                     id: id.clone(),
                     name: id.to_string(),
-                    quota: *quota,
+                    quota: Some(*quota),
                 },
             );
             alloc.allocated.insert(id.to_string(), *allocated);
@@ -305,10 +306,10 @@ mod tests {
             TenantSpec {
                 id: id.clone(),
                 name: "a".to_string(),
-                quota: quota(12, 0, 64),
+                quota: Some(quota(12, 0, 64)),
             },
         );
         manager.install_table(table);
-        assert_eq!(manager.allocated(&id), 12);
+        assert_eq!(manager.allocated(&id), Some(12));
     }
 }
