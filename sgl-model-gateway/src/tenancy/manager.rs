@@ -17,14 +17,10 @@ use super::{
 
 pub struct TenantManager {
     pub(crate) config: TenancyConfig,
-    /// Key table merged with this model's quota rules; what every reader sees.
+    /// Replaced wholesale by the key ConfigMap watcher; shared by every model.
     pub(crate) table: ArcSwap<TenantTable>,
-    /// The key table as loaded, quotas unset. Shared by every model's router.
-    pub(crate) keys_raw: ArcSwap<TenantTable>,
-    /// This model's quota rules, keyed by tenant id.
+    /// This model's quota rules, keyed by tenant id; the only source of quota.
     pub(crate) quota_rules: ArcSwap<super::quota::QuotaRules>,
-    /// Serializes rebuilding `table` from `keys_raw` and `quota_rules`.
-    pub(crate) merge_lock: std::sync::Mutex<()>,
     /// Replaced wholesale by the alloc ConfigMap watcher and by write-back.
     pub(crate) alloc: ArcSwap<AllocTable>,
     /// Serializes read-modify-write cycles against the alloc ConfigMap.
@@ -41,9 +37,7 @@ impl TenantManager {
         Arc::new(Self {
             config,
             table: ArcSwap::from_pointee(TenantTable::default()),
-            keys_raw: ArcSwap::from_pointee(TenantTable::default()),
             quota_rules: ArcSwap::from_pointee(super::quota::QuotaRules::new()),
-            merge_lock: std::sync::Mutex::new(()),
             alloc: ArcSwap::from_pointee(AllocTable::default()),
             alloc_write_lock: tokio::sync::Mutex::new(()),
             pool_total,
@@ -78,17 +72,25 @@ impl TenantManager {
             .clone()
     }
 
-    /// Concurrency cap in force, or `None` when the tenant is unlimited.
-    /// A persisted allocation wins over the spec's `initial`; an unknown or
-    /// quota-less tenant is unlimited.
+    /// This model's quota for a known tenant; `None` means unlimited here.
+    pub fn quota_of(&self, tenant: &TenantId) -> Option<super::types::Quota> {
+        if !self.table().tenants.contains_key(tenant) {
+            return None;
+        }
+        self.quota_rules.load().get(tenant.as_ref()).copied()
+    }
+
+    /// Concurrency cap in force, or `None` when the tenant is unlimited on this
+    /// model. A persisted allocation wins over the rule's `initial`, clamped to
+    /// the rule's current bounds: the rule is edited by hand and may since have
+    /// moved below an allocation written under an older one.
     pub fn allocated(&self, tenant: &TenantId) -> Option<u32> {
-        let quota = self.table().tenants.get(tenant)?.quota?;
+        let quota = self.quota_of(tenant)?;
+        let persisted = self.alloc().allocated.get(tenant.as_ref()).copied();
         Some(
-            self.alloc()
-                .allocated
-                .get(tenant.as_ref())
-                .copied()
-                .unwrap_or(quota.initial),
+            persisted
+                .unwrap_or(quota.initial)
+                .clamp(quota.floor, quota.ceiling),
         )
     }
 

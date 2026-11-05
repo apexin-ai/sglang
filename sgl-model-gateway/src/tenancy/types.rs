@@ -85,18 +85,15 @@ pub struct Quota {
     pub ceiling: u32,
 }
 
+/// A tenant from the shared key table. It carries no quota: quota is per model
+/// and comes from `TenantManager::quota_of`.
 #[derive(Debug, Clone)]
 pub struct TenantSpec {
     pub id: TenantId,
     pub name: String,
-    /// `None` means unlimited: no cap is enforced and the tenant draws nothing
-    /// from the pool. This is the default for a tenant with no `quota:` block.
-    pub quota: Option<Quota>,
 }
 
-/// Immutable snapshot of the tenant table, swapped in whole on every reload.
-/// As published by `TenantManager::table`, each tenant's quota is this model's
-/// rule from the per-model ConfigMap; as parsed from the key table, it is `None`.
+/// Immutable snapshot of the key table, swapped in whole on every reload.
 #[derive(Debug, Default, Clone)]
 pub struct TenantTable {
     pub tenants: HashMap<TenantId, TenantSpec>,

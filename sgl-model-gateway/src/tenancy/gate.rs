@@ -263,14 +263,17 @@ mod tests {
             TenantSpec {
                 id: id.clone(),
                 name: "team-a".to_string(),
-                quota: Some(Quota {
-                    initial: allocated,
-                    floor: 0,
-                    ceiling: 64,
-                }),
             },
         );
-        manager.install_table_with_quotas(table);
+        manager.install_table(table);
+        manager.install_quota_rules(crate::tenancy::quota::QuotaRules::from([(
+            "team-a".to_string(),
+            Quota {
+                initial: allocated,
+                floor: 0,
+                ceiling: 64,
+            },
+        )]));
         let ctx = TenantCtx {
             tenant: id,
             key_id: Arc::from("k1"),
@@ -323,10 +326,9 @@ mod tests {
             TenantSpec {
                 id: id.clone(),
                 name: "team-free".to_string(),
-                quota: None,
             },
         );
-        manager.install_table_with_quotas(table);
+        manager.install_table(table);
         let ctx = TenantCtx {
             tenant: id,
             key_id: Arc::from("k1"),

@@ -63,7 +63,7 @@ impl TenantManager {
         let floors: HashMap<String, u32> = table
             .tenants
             .iter()
-            .filter_map(|(id, spec)| Some((id.to_string(), spec.quota?.floor)))
+            .filter_map(|(id, _)| Some((id.to_string(), self.quota_of(id)?.floor)))
             .collect();
         for (tenant, allocated) in &current {
             metrics::set_tenant_allocated(tenant, *allocated);
@@ -199,6 +199,7 @@ mod tests {
         let manager = TenantManager::new(config);
         let mut table = TenantTable::default();
         let mut alloc = crate::tenancy::types::AllocTable::default();
+        let mut rules = crate::tenancy::quota::QuotaRules::new();
         for (id, quota, allocated) in tenants {
             let id: TenantId = Arc::from(*id);
             table.tenants.insert(
@@ -206,12 +207,13 @@ mod tests {
                 TenantSpec {
                     id: id.clone(),
                     name: id.to_string(),
-                    quota: Some(*quota),
                 },
             );
+            rules.insert(id.to_string(), *quota);
             alloc.allocated.insert(id.to_string(), *allocated);
         }
-        manager.install_table_with_quotas(table);
+        manager.install_table(table);
+        manager.install_quota_rules(rules);
         manager.install_alloc(alloc);
         manager
     }
@@ -306,10 +308,13 @@ mod tests {
             TenantSpec {
                 id: id.clone(),
                 name: "a".to_string(),
-                quota: Some(quota(12, 0, 64)),
             },
         );
-        manager.install_table_with_quotas(table);
+        manager.install_table(table);
+        manager.install_quota_rules(crate::tenancy::quota::QuotaRules::from([(
+            "a".to_string(),
+            quota(12, 0, 64),
+        )]));
         assert_eq!(manager.allocated(&id), Some(12));
     }
 }

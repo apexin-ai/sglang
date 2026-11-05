@@ -44,9 +44,7 @@ impl TenantManager {
     /// Installs a freshly loaded key table and re-applies this model's quota
     /// rules to it.
     pub fn install_table(&self, table: TenantTable) {
-        let _guard = self.merge_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.keys_raw.store(Arc::new(table));
-        self.remerge_locked();
+        self.table.store(Arc::new(table));
     }
 }
 
@@ -71,8 +69,9 @@ struct TenantDocument {
     name: String,
     #[serde(default)]
     keys: Vec<KeyDocumentEntry>,
-    /// Ignored: quota is per model and lives in each model's own ConfigMap
-    /// (see quota.rs). Still accepted so an older key table keeps loading.
+    /// Only here to be rejected: quota is per model and belongs in each
+    /// model's own ConfigMap (see quota.rs), never in the shared key table.
+    #[serde(default)]
     quota: Option<serde_yaml::Value>,
 }
 
@@ -110,11 +109,11 @@ pub fn parse_key_table(yaml: &str, resource_version: String) -> Result<TenantTab
         }
 
         if tenant.quota.is_some() {
-            warn!(
-                "tenant {:?}: `quota` in the key table is ignored; set it in each \
-                 model's quota ConfigMap",
+            return Err(format!(
+                "tenant {:?}: `quota` does not belong in the key table; set it per \
+                 model in that model's quota ConfigMap (quota.yaml)",
                 tenant.id
-            );
+            ));
         }
 
         let mut seen_key_ids = HashMap::new();
@@ -156,7 +155,6 @@ pub fn parse_key_table(yaml: &str, resource_version: String) -> Result<TenantTab
             TenantSpec {
                 id: tenant_id,
                 name: tenant.name,
-                quota: None,
             },
         );
     }
@@ -337,12 +335,10 @@ tenants:
     keys:
       - {id: k1, secret: "secret-a1", role: user}
       - {id: k2, secret: "secret-a2", role: admin, disabled: true}
-    quota: {initial: 32, floor: 0, ceiling: 64}
   - id: team-b
     name: "Team B"
     keys:
       - {id: k1, secret: "secret-b1"}
-    quota: {initial: 8, floor: 4, ceiling: 16}
 "#;
 
     #[test]
@@ -354,8 +350,6 @@ tenants:
 
         let spec = table.tenants.get("team-a").unwrap();
         assert_eq!(spec.name, "Team A");
-        // A quota block in the key table is accepted but no longer applied.
-        assert_eq!(spec.quota, None);
 
         let key = table
             .by_hash
@@ -367,18 +361,10 @@ tenants:
     }
 
     #[test]
-    fn a_tenant_with_no_quota_block_is_unlimited() {
-        let doc = r#"
-version: 1
-tenants:
-  - id: team-a
-    name: "Team A"
-    keys:
-      - {id: k1, secret: "secret-a1"}
-"#;
-        let table = parse_key_table(doc, "1".to_string()).unwrap();
-        let spec = table.tenants.get("team-a").unwrap();
-        assert_eq!(spec.quota, None);
+    fn rejects_a_quota_in_the_key_table() {
+        let doc = "tenants:\n  - id: a\n    keys: [{id: k1, secret: s1}]\n    quota: {initial: 1, floor: 0, ceiling: 2}\n";
+        let err = parse_key_table(doc, "1".to_string()).unwrap_err();
+        assert!(err.contains("quota.yaml"), "{}", err);
     }
 
     #[test]
@@ -389,7 +375,6 @@ tenants:
   - id: team-a
     unknown_tenant_field: 1
     keys: [{id: k1, secret: s1, future_flag: true}]
-    quota: {initial: 1, ceiling: 2, unknown: 9}
 "#;
         let table = parse_key_table(doc, String::new()).unwrap();
         assert_eq!(table.by_hash.len(), 1);

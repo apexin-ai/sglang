@@ -103,14 +103,16 @@ pub fn decide_release(current: u32, amount: u32, quota: &Quota) -> QuotaDecision
 }
 
 fn snapshot_of(manager: &TenantManager, tenant: &TenantId) -> Option<TenantSnapshot> {
-    let table = manager.table();
-    let spec = table.tenants.get(tenant)?;
+    if !manager.table().tenants.contains_key(tenant) {
+        return None;
+    }
+    let quota = manager.quota_of(tenant);
     Some(TenantSnapshot {
         tenant: tenant.to_string(),
         allocated: manager.allocated(tenant),
         inflight: manager.inflight_counter(tenant).load(Ordering::Relaxed),
-        quota: spec.quota,
-        limited: spec.quota.is_some(),
+        quota,
+        limited: quota.is_some(),
         over_quota_total: manager.over_quota_counter(tenant).load(Ordering::Relaxed),
     })
 }
@@ -198,10 +200,10 @@ async fn set_quota(
     Json(req): Json<QuotaRequest>,
 ) -> Response {
     let manager = store.manager();
-    let quota = match manager.table().tenants.get(&ctx.tenant) {
-        Some(spec) => spec.quota,
-        None => return unknown_tenant(&ctx.tenant),
-    };
+    if !manager.table().tenants.contains_key(&ctx.tenant) {
+        return unknown_tenant(&ctx.tenant);
+    }
+    let quota = manager.quota_of(&ctx.tenant);
     let Some(quota) = quota else {
         return unlimited_tenant(&ctx.tenant);
     };
@@ -217,10 +219,10 @@ async fn release_quota(
     Json(req): Json<ReleaseRequest>,
 ) -> Response {
     let manager = store.manager();
-    let quota = match manager.table().tenants.get(&ctx.tenant) {
-        Some(spec) => spec.quota,
-        None => return unknown_tenant(&ctx.tenant),
-    };
+    if !manager.table().tenants.contains_key(&ctx.tenant) {
+        return unknown_tenant(&ctx.tenant);
+    }
+    let quota = manager.quota_of(&ctx.tenant);
     let Some(quota) = quota else {
         return unlimited_tenant(&ctx.tenant);
     };
@@ -279,6 +281,7 @@ mod tests {
     fn store_with_tenants(specs: &[(&str, Option<Quota>)], pool: u32) -> Arc<AllocStore> {
         let manager = TenantManager::new(TenancyConfig::default());
         let mut tenants = HashMap::new();
+        let mut rules = crate::tenancy::quota::QuotaRules::new();
         for (id, q) in specs {
             let tid: TenantId = Arc::from(*id);
             tenants.insert(
@@ -286,15 +289,18 @@ mod tests {
                 TenantSpec {
                     id: tid,
                     name: id.to_string(),
-                    quota: *q,
                 },
             );
+            if let Some(q) = q {
+                rules.insert(id.to_string(), *q);
+            }
         }
-        manager.install_table_with_quotas(TenantTable {
+        manager.install_table(TenantTable {
             tenants,
             by_hash: HashMap::new(),
             resource_version: "1".to_string(),
         });
+        manager.install_quota_rules(rules);
         manager.pool_total.store(pool, Ordering::Relaxed);
         AllocStore::new(manager, Arc::new(NullBackend), WritePolicy::default())
     }
