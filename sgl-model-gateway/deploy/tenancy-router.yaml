@@ -10,6 +10,10 @@
 # Re-applying is safe: the quota ConfigMap declares only `quota.yaml`, so the
 # `alloc.yaml` the gateway writes beside it is left alone.
 #
+# Serves only the prod workers labelled tenancy-pool=dsv41; the rest stay behind
+# dsv41-prod-router. Move a worker between the two by adding or removing that
+# label (and the matching POST/DELETE /workers on dsv41-prod-router).
+#
 # PREREQUISITE while the feature ships as a wheel rather than inside an image:
 # the tenancy-enabled wheel must sit on the node this pod is pinned to, under
 # /mnt/nvme/smg-tenancy/. The container installs it over the image's own
@@ -42,8 +46,9 @@ metadata:
   name: dsv41-tenancy-router
   namespace: infer
 spec:
-  # NodePort to reach it from outside the cluster, as the prod router does.
-  type: ClusterIP
+  # NodePort with no fixed port: Kubernetes assigns one, so applying this to
+  # another namespace or cluster cannot collide with a port already taken.
+  type: NodePort
   selector:
     app: dsv41-tenancy-router
   ports:
@@ -91,7 +96,7 @@ spec:
                 --service-discovery \
                 --service-discovery-namespace infer \
                 --service-discovery-port 30000 \
-                --selector app=dsv41-prod role=worker \
+                --selector app=dsv41-prod role=worker tenancy-pool=dsv41 \
                 --dp-aware \
                 --policy manual \
                 --assignment-mode min_group \
