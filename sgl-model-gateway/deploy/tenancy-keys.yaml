@@ -44,6 +44,16 @@ data:
         keys:
           - {id: y1, secret: "sk-yufan-1420", role: user}
 
+      - id: mohan
+        name: "mohan"
+        keys:
+          - {id: m1, secret: "sk-mohan-4926", role: user}
+
+      - id: yixiao
+        name: "yixiao"
+        keys:
+          - {id: x1, secret: "sk-yixiao-6438", role: user}
+
       - id: ops
         name: "Ops"
         keys:
