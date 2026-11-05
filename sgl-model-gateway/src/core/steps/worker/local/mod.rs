@@ -50,7 +50,10 @@ use crate::{
 
 /// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
 ///
-/// For DP-aware workers, finds all workers with URL prefix `{url}@`.
+/// For DP-aware workers, a base URL finds every rank with prefix `{url}@`, and a
+/// rank URL (`{url}@{rank}`) finds that one rank. The by-id REST routes resolve
+/// an id to its rank URL, so without the exact match they looked for
+/// `{url}@{rank}@` and never found anything.
 /// For regular workers, finds the single worker with exact URL match.
 pub(crate) fn find_workers_by_url(
     registry: &WorkerRegistry,
@@ -58,6 +61,9 @@ pub(crate) fn find_workers_by_url(
     dp_aware: bool,
 ) -> Vec<Arc<dyn Worker>> {
     if dp_aware {
+        if let Some(worker) = registry.get_by_url(url) {
+            return vec![worker];
+        }
         let worker_url_prefix = format!("{}@", url);
         registry
             .get_all()
@@ -359,5 +365,59 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::DPAwareWorkerBuilder;
+
+    fn registry_with_ranks(base: &str, ranks: usize) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for rank in 0..ranks {
+            registry.register(Arc::new(
+                DPAwareWorkerBuilder::new(base, rank, ranks).build(),
+            ));
+        }
+        registry
+    }
+
+    fn urls(workers: &[Arc<dyn Worker>]) -> Vec<String> {
+        let mut out: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dp_aware_base_url_finds_every_rank() {
+        let registry = registry_with_ranks("http://a:30000", 4);
+        registry_with_ranks("http://b:30000", 4)
+            .get_all()
+            .into_iter()
+            .for_each(|w| {
+                registry.register(w);
+            });
+        let found = find_workers_by_url(&registry, "http://a:30000", true);
+        assert_eq!(found.len(), 4);
+        assert!(urls(&found)
+            .iter()
+            .all(|u| u.starts_with("http://a:30000@")));
+    }
+
+    // Removing or updating a DP-aware worker by id passes its rank URL here;
+    // that must resolve to the one rank instead of finding nothing.
+    #[test]
+    fn dp_aware_rank_url_finds_that_rank_only() {
+        let registry = registry_with_ranks("http://a:30000", 4);
+        let found = find_workers_by_url(&registry, "http://a:30000@2", true);
+        assert_eq!(urls(&found), vec!["http://a:30000@2".to_string()]);
+    }
+
+    #[test]
+    fn unknown_urls_find_nothing() {
+        let registry = registry_with_ranks("http://a:30000", 2);
+        assert!(find_workers_by_url(&registry, "http://a:30000@9", true).is_empty());
+        assert!(find_workers_by_url(&registry, "http://z:30000", true).is_empty());
     }
 }
