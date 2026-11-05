@@ -17,6 +17,7 @@ pub mod gate;
 pub mod manager;
 pub mod metrics;
 pub mod pool;
+pub mod quota;
 pub mod source;
 pub mod store;
 pub mod types;

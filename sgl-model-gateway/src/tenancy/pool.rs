@@ -211,7 +211,7 @@ mod tests {
             );
             alloc.allocated.insert(id.to_string(), *allocated);
         }
-        manager.install_table(table);
+        manager.install_table_with_quotas(table);
         manager.install_alloc(alloc);
         manager
     }
@@ -309,7 +309,7 @@ mod tests {
                 quota: Some(quota(12, 0, 64)),
             },
         );
-        manager.install_table(table);
+        manager.install_table_with_quotas(table);
         assert_eq!(manager.allocated(&id), Some(12));
     }
 }

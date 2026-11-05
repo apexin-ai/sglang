@@ -37,7 +37,9 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["smg-tenant-alloc"]
-    verbs: ["get", "update"]
+    # patch, not update: the gateway rewrites only alloc.yaml, leaving the
+    # hand-edited quota.yaml in the same ConfigMap untouched.
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -94,8 +94,10 @@ pub struct TenantSpec {
     pub quota: Option<Quota>,
 }
 
-/// Immutable snapshot of the key ConfigMap, swapped in whole on every reload.
-#[derive(Debug, Default)]
+/// Immutable snapshot of the tenant table, swapped in whole on every reload.
+/// As published by `TenantManager::table`, each tenant's quota is this model's
+/// rule from the per-model ConfigMap; as parsed from the key table, it is `None`.
+#[derive(Debug, Default, Clone)]
 pub struct TenantTable {
     pub tenants: HashMap<TenantId, TenantSpec>,
     /// Lookup by key hash; a tenant may hold several keys for rotation.

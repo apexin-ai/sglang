@@ -78,6 +78,19 @@ pub async fn build(config: &RouterConfig) -> Option<TenancyRuntime> {
     if let Err(e) = store.load_initial().await {
         warn!("tenancy: could not load persisted allocations: {}", e);
     }
+    if let Err(e) = super::store::load_quota_rules(
+        &manager,
+        client.clone(),
+        &namespace,
+        &config.tenancy_alloc_configmap,
+    )
+    .await
+    {
+        warn!(
+            "tenancy: could not load quota rules, no tenant is capped: {}",
+            e
+        );
+    }
     if let Err(e) = ConfigMapKeySource::with_client(client.clone())
         .start(Arc::clone(&manager))
         .await

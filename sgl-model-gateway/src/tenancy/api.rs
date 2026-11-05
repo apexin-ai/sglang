@@ -290,7 +290,7 @@ mod tests {
                 },
             );
         }
-        manager.install_table(TenantTable {
+        manager.install_table_with_quotas(TenantTable {
             tenants,
             by_hash: HashMap::new(),
             resource_version: "1".to_string(),

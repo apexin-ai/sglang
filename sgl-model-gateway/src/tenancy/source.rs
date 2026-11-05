@@ -41,8 +41,12 @@ pub trait KeySource: Send + Sync {
 }
 
 impl TenantManager {
+    /// Installs a freshly loaded key table and re-applies this model's quota
+    /// rules to it.
     pub fn install_table(&self, table: TenantTable) {
-        self.table.store(Arc::new(table));
+        let _guard = self.merge_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.keys_raw.store(Arc::new(table));
+        self.remerge_locked();
     }
 }
 
@@ -67,8 +71,9 @@ struct TenantDocument {
     name: String,
     #[serde(default)]
     keys: Vec<KeyDocumentEntry>,
-    /// Absent means unlimited; a present block caps the tenant's concurrency.
-    quota: Option<QuotaDocument>,
+    /// Ignored: quota is per model and lives in each model's own ConfigMap
+    /// (see quota.rs). Still accepted so an older key table keeps loading.
+    quota: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,17 +84,6 @@ struct KeyDocumentEntry {
     role: KeyRole,
     #[serde(default)]
     disabled: bool,
-}
-
-/// Mirrors `Quota` but defaults each field, so a partial `quota:` block loads.
-#[derive(Debug, Default, Deserialize)]
-struct QuotaDocument {
-    #[serde(default)]
-    initial: u32,
-    #[serde(default)]
-    floor: u32,
-    #[serde(default)]
-    ceiling: u32,
 }
 
 /// Parses the `tenants.yaml` document into a table.
@@ -115,29 +109,13 @@ pub fn parse_key_table(yaml: &str, resource_version: String) -> Result<TenantTab
             return Err(format!("duplicate tenant id {:?}", tenant.id));
         }
 
-        let quota = match tenant.quota {
-            None => None,
-            Some(doc) => {
-                let quota = super::types::Quota {
-                    initial: doc.initial,
-                    floor: doc.floor,
-                    ceiling: doc.ceiling,
-                };
-                if quota.ceiling < quota.floor {
-                    return Err(format!(
-                        "tenant {:?}: quota ceiling {} is below floor {}",
-                        tenant.id, quota.ceiling, quota.floor
-                    ));
-                }
-                if quota.initial < quota.floor || quota.initial > quota.ceiling {
-                    return Err(format!(
-                        "tenant {:?}: quota initial {} is outside [{}, {}]",
-                        tenant.id, quota.initial, quota.floor, quota.ceiling
-                    ));
-                }
-                Some(quota)
-            }
-        };
+        if tenant.quota.is_some() {
+            warn!(
+                "tenant {:?}: `quota` in the key table is ignored; set it in each \
+                 model's quota ConfigMap",
+                tenant.id
+            );
+        }
 
         let mut seen_key_ids = HashMap::new();
         for entry in tenant.keys {
@@ -178,7 +156,7 @@ pub fn parse_key_table(yaml: &str, resource_version: String) -> Result<TenantTab
             TenantSpec {
                 id: tenant_id,
                 name: tenant.name,
-                quota,
+                quota: None,
             },
         );
     }
@@ -376,8 +354,8 @@ tenants:
 
         let spec = table.tenants.get("team-a").unwrap();
         assert_eq!(spec.name, "Team A");
-        assert_eq!(spec.quota.unwrap().initial, 32);
-        assert_eq!(spec.quota.unwrap().ceiling, 64);
+        // A quota block in the key table is accepted but no longer applied.
+        assert_eq!(spec.quota, None);
 
         let key = table
             .by_hash
@@ -441,15 +419,6 @@ tenants:
         assert!(parse_key_table(dup_key, String::new())
             .unwrap_err()
             .contains("duplicate key id"));
-    }
-
-    #[test]
-    fn rejects_inconsistent_quota() {
-        let doc =
-            "tenants:\n  - id: a\n    keys: []\n    quota: {initial: 99, floor: 0, ceiling: 8}\n";
-        assert!(parse_key_table(doc, String::new())
-            .unwrap_err()
-            .contains("outside"));
     }
 
     #[test]

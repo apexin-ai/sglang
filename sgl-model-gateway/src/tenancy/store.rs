@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
-    api::{Api, PostParams},
+    api::{Api, Patch, PatchParams, PostParams},
     runtime::{
         watcher::{watcher, Config as WatcherConfig},
         WatchStreamExt,
@@ -36,7 +36,11 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::{manager::TenantManager, types::AllocTable};
+use super::{
+    manager::TenantManager,
+    quota::{parse_quota_rules, QuotaRules, QUOTA_DATA_KEY},
+    types::AllocTable,
+};
 
 /// Key holding the serialized `AllocTable` inside the ConfigMap.
 pub const ALLOC_DATA_KEY: &str = "alloc.yaml";
@@ -160,7 +164,7 @@ impl AllocBackend for KubeAllocBackend {
         resource_version: &str,
     ) -> Result<String, BackendError> {
         let rendered = render_alloc(table).map_err(BackendError::Other)?;
-        let mut cm = ConfigMap {
+        let cm = ConfigMap {
             metadata: kube::core::ObjectMeta {
                 name: Some(self.name.clone()),
                 ..Default::default()
@@ -183,9 +187,15 @@ impl AllocBackend for KubeAllocBackend {
                     other => classify(other),
                 })?
         } else {
-            cm.metadata.resource_version = Some(resource_version.to_string());
+            // A merge patch touches only alloc.yaml: the same ConfigMap carries the
+            // hand-edited quota.yaml, which a replace would wipe. The resourceVersion
+            // keeps it a conditional write, so a concurrent edit still surfaces as 409.
+            let patch = serde_json::json!({
+                "metadata": {"resourceVersion": resource_version},
+                "data": {ALLOC_DATA_KEY: cm.data.as_ref().and_then(|d| d.get(ALLOC_DATA_KEY))},
+            });
             self.api
-                .replace(&self.name, &PostParams::default(), &cm)
+                .patch(&self.name, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
                 .map_err(classify)?
         };
@@ -219,6 +229,44 @@ fn parse_alloc_configmap(cm: &ConfigMap) -> AllocTable {
             }
         })
         .unwrap_or_default()
+}
+
+/// The quota rules a ConfigMap carries. An absent `quota.yaml` means no tenant
+/// is capped on this model.
+pub fn quota_rules_of(cm: &ConfigMap) -> Result<QuotaRules, String> {
+    match cm.data.as_ref().and_then(|d| d.get(QUOTA_DATA_KEY)) {
+        Some(raw) => parse_quota_rules(raw),
+        None => Ok(QuotaRules::new()),
+    }
+}
+
+/// Installs the rules a ConfigMap carries, or keeps the ones in force when they
+/// do not parse -- a typo must not silently drop every cap.
+fn adopt_quota_rules(manager: &TenantManager, cm: &ConfigMap) {
+    match quota_rules_of(cm) {
+        Ok(rules) => {
+            if **manager.quota_rules() != rules {
+                info!("quota rules loaded for {} tenants", rules.len());
+                manager.install_quota_rules(rules);
+            }
+        }
+        Err(e) => error!("quota.yaml rejected, keeping the rules in force: {}", e),
+    }
+}
+
+/// Startup read of this model's quota rules, before any request is served.
+pub async fn load_quota_rules(
+    manager: &TenantManager,
+    client: Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), String> {
+    let api: Api<ConfigMap> = Api::namespaced(client, namespace);
+    match api.get_opt(name).await.map_err(|e| e.to_string())? {
+        Some(cm) => adopt_quota_rules(manager, &cm),
+        None => info!("quota ConfigMap {} absent; no tenant is capped", name),
+    }
+    Ok(())
 }
 
 pub struct AllocStore {
@@ -362,6 +410,7 @@ impl AllocStore {
                 .try_for_each(move |cm| {
                     let store = Arc::clone(&store);
                     async move {
+                        adopt_quota_rules(&store.manager, &cm);
                         let observed = parse_alloc_configmap(&cm);
                         if store.is_self_echo(&observed) {
                             return Ok(());

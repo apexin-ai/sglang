@@ -1,55 +1,40 @@
-# Multi-tenant SGLang router: keys, allocations, Service and Deployment.
+# Multi-tenant SGLang router for DeepSeek-V4.1: its quota, Service and
+# Deployment.
 #
 #   kubectl -n infer apply -f tenancy-router.yaml
 #
-# The ServiceAccount and its Roles live in tenancy-rbac.yaml and are applied
-# once; this file only references the account by name.
+# The ServiceAccount and its Roles live in tenancy-rbac.yaml and the tenant
+# keys in tenancy-keys.yaml, shared by every model; both are applied once, and
+# this file only references them by name.
 #
-# Re-applying is safe: the alloc ConfigMap declares no `data`, so allocations
-# the gateway has written to it are left alone.
+# Re-applying is safe: the quota ConfigMap declares only `quota.yaml`, so the
+# `alloc.yaml` the gateway writes beside it is left alone.
 #
 # PREREQUISITE while the feature ships as a wheel rather than inside an image:
 # the tenancy-enabled wheel must sit on the node this pod is pinned to, under
 # /mnt/nvme/smg-tenancy/. The container installs it over the image's own
 # sglang-router at startup; the published image does not carry the feature.
 ---
-# Secrets are plaintext here by choice. Anyone who can read ConfigMaps in this
-# namespace can read these keys; use a Secret if that is not acceptable.
-# `role: admin` only unlocks the control plane and listing every tenant.
-# quota: initial seeds the allocation, floor is the promise a pool shrink will
-# not break, ceiling is how far a tenant may grow itself.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: smg-tenant-keys
-  namespace: infer
-data:
-  tenants.yaml: |
-    version: 1
-    tenants:
-      # No quota block: unlimited concurrency, the default.
-      - id: chengsong
-        name: "chengsong"
-        keys:
-          - {id: a1, secret: "sk-chengsong-1012", role: user}
-
-      - id: sunzhen
-        name: "sunzhen"
-        keys:
-          - {id: s1, secret: "sk-sunzhen-1646", role: user}
-
-      - id: ops
-        name: "Ops"
-        keys:
-          - {id: ops1, secret: "sk-admin-ops", role: admin}
----
-# No `data`: the gateway owns the contents, and leaving it out keeps a re-apply
-# of this file from resetting live allocations.
+# This model's quota. `quota.yaml` is edited by hand; `alloc.yaml` is written
+# by the gateway (current allocations) and must not be declared here.
+#
+# A tenant not listed is unlimited on this model. Listing one sets a concurrency
+# cap, which today is accounted and exported as metrics but not enforced.
+# initial seeds the allocation, floor is what a pool shrink may not take away,
+# and ceiling is how far the tenant may grow itself via POST /tenants/self/quota.
+# Edits take effect within seconds; a document that fails to parse leaves the
+# rules in force untouched.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: smg-tenant-alloc
   namespace: infer
+data:
+  quota.yaml: |
+    version: 1
+    tenants: {}
+    # tenants:
+    #   chengsong: {initial: 16, floor: 4, ceiling: 48}
 ---
 apiVersion: v1
 kind: Service

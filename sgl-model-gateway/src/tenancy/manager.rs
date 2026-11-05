@@ -17,8 +17,14 @@ use super::{
 
 pub struct TenantManager {
     pub(crate) config: TenancyConfig,
-    /// Replaced wholesale by the key ConfigMap watcher.
+    /// Key table merged with this model's quota rules; what every reader sees.
     pub(crate) table: ArcSwap<TenantTable>,
+    /// The key table as loaded, quotas unset. Shared by every model's router.
+    pub(crate) keys_raw: ArcSwap<TenantTable>,
+    /// This model's quota rules, keyed by tenant id.
+    pub(crate) quota_rules: ArcSwap<super::quota::QuotaRules>,
+    /// Serializes rebuilding `table` from `keys_raw` and `quota_rules`.
+    pub(crate) merge_lock: std::sync::Mutex<()>,
     /// Replaced wholesale by the alloc ConfigMap watcher and by write-back.
     pub(crate) alloc: ArcSwap<AllocTable>,
     /// Serializes read-modify-write cycles against the alloc ConfigMap.
@@ -35,6 +41,9 @@ impl TenantManager {
         Arc::new(Self {
             config,
             table: ArcSwap::from_pointee(TenantTable::default()),
+            keys_raw: ArcSwap::from_pointee(TenantTable::default()),
+            quota_rules: ArcSwap::from_pointee(super::quota::QuotaRules::new()),
+            merge_lock: std::sync::Mutex::new(()),
             alloc: ArcSwap::from_pointee(AllocTable::default()),
             alloc_write_lock: tokio::sync::Mutex::new(()),
             pool_total,

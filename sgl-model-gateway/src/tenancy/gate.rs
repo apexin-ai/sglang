@@ -270,7 +270,7 @@ mod tests {
                 }),
             },
         );
-        manager.install_table(table);
+        manager.install_table_with_quotas(table);
         let ctx = TenantCtx {
             tenant: id,
             key_id: Arc::from("k1"),
@@ -326,7 +326,7 @@ mod tests {
                 quota: None,
             },
         );
-        manager.install_table(table);
+        manager.install_table_with_quotas(table);
         let ctx = TenantCtx {
             tenant: id,
             key_id: Arc::from("k1"),

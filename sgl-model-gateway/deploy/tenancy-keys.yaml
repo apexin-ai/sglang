@@ -1,0 +1,40 @@
+# Tenant keys, shared by every model's tenancy router in the namespace.
+#
+#   kubectl -n infer apply -f tenancy-keys.yaml
+#
+# One table for all models: a tenant's key works on every router that points
+# --tenancy-keys-configmap here. Quota is not in this file -- it is per model
+# and lives in each model's own quota ConfigMap (`quota.yaml`), so the same
+# tenant can be capped differently on each model and is unlimited wherever no
+# rule names it.
+#
+# Edit and re-apply to add a tenant or rotate a key; every router reloads within
+# seconds. A document that fails to parse leaves the previous table in force
+# rather than locking everyone out.
+#
+# Secrets are plaintext here by choice. Anyone who can read ConfigMaps in this
+# namespace can read these keys; use a Secret if that is not acceptable.
+# `role: admin` only unlocks GET /tenants; it grants no capacity.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smg-tenant-keys
+  namespace: infer
+data:
+  tenants.yaml: |
+    version: 1
+    tenants:
+      - id: chengsong
+        name: "chengsong"
+        keys:
+          - {id: a1, secret: "sk-chengsong-1012", role: user}
+
+      - id: sunzhen
+        name: "sunzhen"
+        keys:
+          - {id: s1, secret: "sk-sunzhen-1646", role: user}
+
+      - id: ops
+        name: "Ops"
+        keys:
+          - {id: ops1, secret: "sk-admin-ops", role: admin}
