@@ -1,14 +1,20 @@
-# RBAC for the gateway's tenancy module.
+# ServiceAccount and RBAC for the tenancy router. Apply once per namespace,
+# ahead of tenancy-router.yaml, which only references the account by name:
+#
+#   kubectl -n infer apply -f tenancy-rbac.yaml
+#
+# To run under an account that already exists instead, skip this file and point
+# `serviceAccountName` in tenancy-router.yaml at that account, after granting it
+# the two Roles below.
 #
 # The key ConfigMap is readable only: a gateway that could write it could mint
-# itself an admin key. Allocations live in a second ConfigMap that the gateway
-# reads and writes, and that holds no credentials.
+# itself an admin key. Allocations live in a second ConfigMap it reads and
+# writes, which holds no credentials.
 #
-# resourceNames pins the get/update rules to the two objects named in
-# --tenancy-keys-configmap and --tenancy-alloc-configmap; adjust the names here if
-# those flags change. Kubernetes cannot restrict list, watch or create by
-# resourceNames, so those rules are namespace-wide; the watch is narrowed
-# client-side by a metadata.name field selector.
+# list/watch cannot be restricted by resourceNames, so those rules stay
+# namespace-wide; the watch is narrowed client-side by a metadata.name field
+# selector. Creating the alloc ConfigMap is not granted either — apply it from
+# tenancy-router.yaml instead, since `create` cannot be restricted to one name.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -32,12 +38,6 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["smg-tenant-alloc"]
     verbs: ["get", "update"]
-  # Only needed when the alloc ConfigMap is not pre-created; drop this rule
-  # after applying tenancy-configmaps.example.yaml, since create cannot be
-  # restricted to one object name.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -48,6 +48,32 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: smg-tenancy
+subjects:
+  - kind: ServiceAccount
+    name: smg-tenancy
+    namespace: infer
+---
+# Separate from the Role above so the ConfigMap grants stay minimal. Only needed
+# when the router discovers workers by label instead of taking --worker-urls.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smg-pod-discovery
+  namespace: infer
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smg-pod-discovery
+  namespace: infer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: smg-pod-discovery
 subjects:
   - kind: ServiceAccount
     name: smg-tenancy

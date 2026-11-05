@@ -1,0 +1,148 @@
+# Multi-tenant SGLang router: keys, allocations, Service and Deployment.
+#
+#   kubectl -n infer apply -f tenancy-router.yaml
+#
+# The ServiceAccount and its Roles live in tenancy-rbac.yaml and are applied
+# once; this file only references the account by name.
+#
+# Re-applying is safe: the alloc ConfigMap declares no `data`, so allocations
+# the gateway has written to it are left alone.
+#
+# PREREQUISITE while the feature ships as a wheel rather than inside an image:
+# the tenancy-enabled wheel must sit on the node this pod is pinned to, under
+# /mnt/nvme/smg-tenancy/. The container installs it over the image's own
+# sglang-router at startup; the published image does not carry the feature.
+---
+# Secrets are plaintext here by choice. Anyone who can read ConfigMaps in this
+# namespace can read these keys; use a Secret if that is not acceptable.
+# `role: admin` only unlocks the control plane and listing every tenant.
+# quota: initial seeds the allocation, floor is the promise a pool shrink will
+# not break, ceiling is how far a tenant may grow itself.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smg-tenant-keys
+  namespace: infer
+data:
+  tenants.yaml: |
+    version: 1
+    tenants:
+      - id: team-a
+        name: "Team A"
+        keys:
+          - {id: a1, secret: "tenancy-test-key-a", role: user}
+        quota: {initial: 8, floor: 2, ceiling: 32}
+      - id: team-b
+        name: "Team B"
+        keys:
+          - {id: b1, secret: "tenancy-test-key-b", role: admin}
+        quota: {initial: 4, floor: 1, ceiling: 16}
+---
+# No `data`: the gateway owns the contents, and leaving it out keeps a re-apply
+# of this file from resetting live allocations.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smg-tenant-alloc
+  namespace: infer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv41-tenancy-router
+  namespace: infer
+spec:
+  # NodePort to reach it from outside the cluster, as the prod router does.
+  type: ClusterIP
+  selector:
+    app: dsv41-tenancy-router
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+      protocol: TCP
+    - name: metrics
+      port: 29000
+      targetPort: 29000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsv41-tenancy-router
+  namespace: infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dsv41-tenancy-router
+  template:
+    metadata:
+      labels:
+        app: dsv41-tenancy-router
+    spec:
+      # Created by tenancy-rbac.yaml; point this at an existing account instead
+      # if that account holds the smg-tenancy and smg-pod-discovery Roles.
+      serviceAccountName: smg-tenancy
+      # Pinned to the node holding the wheel on its local NVMe. Drop this once
+      # the wheel ships inside an image.
+      nodeName: e01-cn-sxt50h9v602
+      volumes:
+        - name: smg-tenancy
+          hostPath:
+            path: /mnt/nvme/smg-tenancy
+            type: Directory
+      containers:
+        - name: router
+          image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261026-8252e3af
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              sha256sum /mnt/nvme/smg-tenancy/sglang_router-*.whl
+              python3 -m pip install --no-deps --force-reinstall /mnt/nvme/smg-tenancy/sglang_router-*.whl
+              exec python3 -m sglang_router.launch_router \
+                --service-discovery \
+                --service-discovery-namespace infer \
+                --service-discovery-port 30000 \
+                --selector app=dsv41-prod role=worker \
+                --dp-aware \
+                --policy manual \
+                --assignment-mode min_group \
+                --request-timeout-secs 10800 \
+                --balance-rel-threshold 2 \
+                --balance-abs-threshold 20 \
+                --worker-startup-timeout-secs 3600 \
+                --require-routing-key \
+                --tenancy-namespace infer \
+                --tenancy-keys-configmap smg-tenant-keys \
+                --tenancy-alloc-configmap smg-tenant-alloc \
+                --tenancy-pool-headroom 0.8 \
+                --host 0.0.0.0 \
+                --port 30000
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+            # Declared so the namespace's PodMonitor scrapes the tenant metrics.
+            - name: metrics
+              containerPort: 29000
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: smg-tenancy
+              mountPath: /mnt/nvme/smg-tenancy
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 15
+            timeoutSeconds: 1
+            failureThreshold: 3
