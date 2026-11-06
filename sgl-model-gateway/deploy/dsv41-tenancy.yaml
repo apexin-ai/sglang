@@ -1,0 +1,263 @@
+# Multi-tenant DeepSeek-V4.1-Flash stack on H20: workers plus a tenancy-aware router.
+#
+#   kubectl -n infer apply -f dsv41-tenancy.yaml
+#
+# To run another copy, replace the prefix `dsv41-tenant-` throughout and change
+# the values marked PER-MODEL. Everything named without that prefix is shared
+# and stays as it is.
+#
+# PREREQUISITES, applied once per namespace and only referenced here:
+#   - tenancy-rbac.yaml: ServiceAccount smg-tenancy, which reads the key table
+#     and discovers pods.
+#   - tenancy-keys.yaml: the shared smg-tenant-keys table. Keys are not in this
+#     file; quota is, in dsv41-tenant-alloc's `quota.yaml`.
+#   - the tenancy-enabled wheel on CPFS at the WHEEL path below. The image's
+#     own sglang-router is replaced at startup; the published one lacks the feature.
+#   - the weights on every H20 node's NVMe at the weights hostPath below. A node
+#     without them leaves its pod stuck in ContainerCreating.
+#
+# Worker labels are deliberately not app=dsv41-prod: dsv41-prod-router and
+# dsv41-prod2-router discover by that label and would pick these pods up.
+#
+# PER-MODEL (not covered by the prefix replacement):
+#   1. namespace       infer
+#   2. model path, served name and the sglang flags/env on the worker
+#   3. the kernel patch set on CPFS (kdev-patch subPath)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsv41-tenant-worker
+  namespace: infer
+  labels: {app: dsv41-tenant-worker, role: worker}
+spec:
+  # One worker is a whole node (8 GPUs, TP8 + attn DP8).
+  replicas: 2
+  # A new pod needs a free node; Recreate avoids waiting on one during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: dsv41-tenant-worker, role: worker}
+  template:
+    metadata:
+      labels: {app: dsv41-tenant-worker, role: worker}
+    spec:
+      nodeSelector:
+        aliyun.accelerator/nvidia_name: NVIDIA-H20-3e
+      tolerations:
+      - {effect: NoSchedule, key: node-role.alibabacloud.com/lingjun, operator: Exists}
+      imagePullSecrets:
+      - name: acr2
+      hostIPC: true
+      # sglang is PID 1 via exec, so SIGTERM reaches it and in-flight requests drain.
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: sglang
+        image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261026-8252e3af
+        imagePullPolicy: IfNotPresent
+        command: [bash, -c]
+        args:
+        - |
+          set -ex
+          # Same patch set as the dsv41-prod workers (b32 FP8 GEMM, V4.1 indexer,
+          # humming MoE runner); the image predates them.
+          SG=/sgl-workspace/sglang/python/sglang
+          P=/opt/kdev_patch
+          cp $P/b32/kernels_ops_gemm_fp8_block32_gemm_sm90.py $SG/kernels/ops/gemm/fp8_block32_gemm_sm90.py
+          cp $P/b32/kernels_ops_gemm___init__.py $SG/kernels/ops/gemm/__init__.py
+          cp $P/b32/srt_layers_quantization_fp8_utils.py $SG/srt/layers/quantization/fp8_utils.py
+          cp $P/b32/srt_environ.py $SG/srt/environ.py
+          cp $P/b32/kernels_jit_csrc_deepseek_v4_candidate_block_table.cuh $SG/kernels/jit/csrc/deepseek_v4/candidate_block_table.cuh
+          cp $P/b32/kernels_ops_attention_dsv4_fp4_indexer_sm90.py $SG/kernels/ops/attention/dsv4/fp4_indexer_sm90.py
+          cp $P/b32/kernels_ops_attention___init__.py $SG/kernels/ops/attention/__init__.py
+          cp $P/b32/srt_layers_attention_dsv4_v41_indexer___init__.py $SG/srt/layers/attention/dsv4/v41_indexer/__init__.py
+          cp $P/b32/srt_layers_attention_dsv4_v41_indexer_full_topk.py $SG/srt/layers/attention/dsv4/v41_indexer/full_topk.py
+          cp $P/b32/srt_layers_attention_dsv4_v41_indexer_sm90_decode.py $SG/srt/layers/attention/dsv4/v41_indexer/sm90_decode.py
+          cp $P/b32/srt_layers_moe_moe_runner_humming.py $SG/srt/layers/moe/moe_runner/humming.py
+          cp $P/fp4_indexer.py $SG/kernels/ops/attention/dsv4/fp4_indexer.py
+          md5sum $SG/srt/layers/moe/moe_runner/humming.py $SG/kernels/ops/attention/dsv4/fp4_indexer.py
+          exec sglang serve \
+            --trust-remote-code \
+            --model-path /mnt/nvme/checkpoints/DeepSeek-V4.1-Flash-1017 \
+            --served-model-name deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+            --context-length 262144 \
+            --tp 8 \
+            --ep-size 8 \
+            --attn-dp-size 8 \
+            --enable-dp-lm-head \
+            --mem-fraction-static 0.8 \
+            --attention-backend dsv4 \
+            --moe-runner-backend humming \
+            --max-running-requests 256 \
+            --cuda-graph-max-bs-decode 64 \
+            --chunked-prefill-size 32768 \
+            --speculative-algorithm DSPARK \
+            --speculative-dspark-block-size 5 \
+            --enable-metrics \
+            --reasoning-parser auto \
+            --tool-call-parser auto \
+            --host 0.0.0.0 \
+            --port 30000
+        env:
+        - {name: SGLANG_HUMMING_INPUT_QUANT_CONFIG, value: '{"a_dtype": "float8e4m3", "input_scale_group_size": 32}'}
+        - {name: SGLANG_DP_USE_REDUCE_SCATTER, value: "1"}
+        - {name: SGLANG_VARIANT, value: dsv41-tenant-b5}
+        ports:
+        - {name: http, containerPort: 30000}
+        readinessProbe:
+          httpGet: {path: /health, port: 30000}
+          periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 5
+        resources:
+          limits: {cpu: "64", memory: 600Gi, nvidia.com/gpu: "8"}
+          requests: {cpu: "64", memory: 600Gi, nvidia.com/gpu: "8"}
+        volumeMounts:
+        - {name: shm, mountPath: /dev/shm}
+        - {name: weights, mountPath: /mnt/nvme/checkpoints/DeepSeek-V4.1-Flash-1017, readOnly: true}
+        - {name: jit-cache, mountPath: /root/.cache}
+        - {name: triton-cache, mountPath: /root/.triton}
+        - {name: nvme-tmp, mountPath: /tmp}
+        - {name: cpfs, mountPath: /opt/kdev_patch, subPath: dsf-infer-opt/sglang-patches/dsv41-b6921a364c16, readOnly: true}
+      volumes:
+      - name: shm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
+      - name: weights
+        hostPath: {path: /mnt/nvme/checkpoints/DeepSeek-V4.1-Flash-1017, type: Directory}
+      # Shared with the dsv41-prod workers on purpose, so a first start is not cold.
+      - name: jit-cache
+        hostPath: {path: /mnt/nvme/jit-cache/dot-cache, type: DirectoryOrCreate}
+      - name: triton-cache
+        hostPath: {path: /mnt/nvme/jit-cache/triton, type: DirectoryOrCreate}
+      - name: nvme-tmp
+        hostPath: {path: /mnt/nvme/tmp-sgl, type: DirectoryOrCreate}
+      - name: cpfs
+        persistentVolumeClaim: {claimName: bmcpfs, readOnly: true}
+---
+# Write access to this model's allocation table only. The key table stays
+# read-only everywhere: a gateway that could write it could mint itself an
+# admin key.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dsv41-tenant-alloc-writer
+  namespace: infer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["dsv41-tenant-alloc"]
+    # patch, not update: the gateway rewrites only alloc.yaml, leaving the
+    # hand-edited quota.yaml in the same ConfigMap untouched.
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dsv41-tenant-alloc-writer
+  namespace: infer
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: dsv41-tenant-alloc-writer}
+subjects:
+  - {kind: ServiceAccount, name: smg-tenancy, namespace: infer}
+---
+# This model's quota. `quota.yaml` is edited by hand; `alloc.yaml` is written
+# by the gateway and must not be declared here, which is also what keeps a
+# re-apply from resetting it.
+#
+# A tenant not listed is unlimited on this model. Listing one sets a concurrency
+# cap, which today is accounted and exported as metrics but not enforced.
+# initial seeds the allocation, floor is what a pool shrink may not take away,
+# and ceiling is how far the tenant may grow itself via POST /tenants/self/quota.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dsv41-tenant-alloc
+  namespace: infer
+  labels: {app: dsv41-tenant-router}
+data:
+  quota.yaml: |
+    version: 1
+    tenants: {}
+    # tenants:
+    #   chengsong: {initial: 16, floor: 4, ceiling: 48}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsv41-tenant-router
+  namespace: infer
+  labels: {app: dsv41-tenant-router, role: router}
+spec:
+  replicas: 1   # manual policy keeps the session->worker table in process memory; do not run 2 replicas
+  selector:
+    matchLabels: {app: dsv41-tenant-router, role: router}
+  template:
+    metadata:
+      labels: {app: dsv41-tenant-router, role: router}
+    spec:
+      # Created by tenancy-rbac.yaml.
+      serviceAccountName: smg-tenancy
+      nodeSelector:
+        aliyun.accelerator/nvidia_name: NVIDIA-H20-3e
+      tolerations:
+      - {effect: NoSchedule, key: node-role.alibabacloud.com/lingjun, operator: Exists}
+      volumes:
+      - name: cpfs
+        persistentVolumeClaim: {claimName: bmcpfs, readOnly: true}
+      containers:
+      - name: router
+        image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261026-8252e3af
+        imagePullPolicy: IfNotPresent
+        command: [bash, -c]
+        args:
+        - |
+          set -ex
+          WHEEL=/cpfs/dsf-infer-opt/smg-tenancy/sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl
+          sha256sum "$WHEEL"
+          python3 -m pip install --no-deps --force-reinstall "$WHEEL"
+          exec python3 -m sglang_router.launch_router \
+            --service-discovery \
+            --selector app=dsv41-tenant-worker role=worker \
+            --service-discovery-port 30000 \
+            --service-discovery-namespace infer \
+            --dp-aware \
+            --policy manual \
+            --assignment-mode min_group \
+            --balance-rel-threshold 2 \
+            --balance-abs-threshold 20 \
+            --worker-startup-timeout-secs 3600 \
+            --request-timeout-secs 10800 \
+            --require-routing-key \
+            --tenancy-namespace infer \
+            --tenancy-keys-configmap smg-tenant-keys \
+            --tenancy-alloc-configmap dsv41-tenant-alloc \
+            --tenancy-pool-headroom 0.8 \
+            --prometheus-host 0.0.0.0 \
+            --prometheus-port 29000 \
+            --host 0.0.0.0 \
+            --port 30000
+        ports:
+        - {name: http, containerPort: 30000}
+        # Declared so the namespace's PodMonitor scrapes it; not on the Service.
+        - {name: http-metrics, containerPort: 29000}
+        readinessProbe:
+          httpGet: {path: /health, port: 30000}
+          periodSeconds: 10
+          timeoutSeconds: 10
+        resources:
+          limits: {cpu: "16", memory: 32Gi}
+          requests: {cpu: "16", memory: 32Gi}
+        volumeMounts:
+        - {name: cpfs, mountPath: /cpfs/, readOnly: true}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv41-tenant-router
+  namespace: infer
+  labels: {app: dsv41-tenant-router}
+spec:
+  # No fixed nodePort: Kubernetes assigns a free one.
+  type: NodePort
+  selector: {app: dsv41-tenant-router, role: router}
+  ports:
+  - {name: http, port: 30000, targetPort: 30000}
